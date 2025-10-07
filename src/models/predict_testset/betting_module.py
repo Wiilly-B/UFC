@@ -5,7 +5,7 @@ Handles all betting calculations, evaluations, and results display
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table

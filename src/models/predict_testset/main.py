@@ -4,23 +4,21 @@ Main module containing core logic, configuration, and entry point
 """
 import os
 import sys
+import re  # <-- added
 import pickle
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from datetime import datetime
 from io import StringIO
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
-from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
-from rich.columns import Columns
 
 
 @dataclass
@@ -48,12 +46,15 @@ class Config:
     # Model settings
     use_ensemble: bool = True  # Whether to use ensemble of models
     model_files: List[str] = field(default_factory=lambda: [
-        'run1_final_model_20251007_022504.json',
-        'run2_final_model_20251007_023852.json',
-        'run3_final_model_20251007_025103.json',
-        'run4_final_model_20251007_030437.json',
-        'run5_final_model_20251007_031843.json'
+        # 'run1_final_model_20251007_022504.json',
+        # 'run2_final_model_20251007_023852.json',
+        # 'run3_final_model_20251007_025103.json',
+        # 'run4_final_model_20251007_030437.json',
+        # 'run5_final_model_20251007_031843.json'
     ])
+    # optional folder-based auto-discovery (all files named like runX*.json)
+    model_dir: Optional[str] = None
+    model_filename_pattern: str = r'^run\d.*\.json$'
 
     # Data paths
     val_data_path: str = '../../../data/train_test/val_data.csv'
@@ -117,103 +118,6 @@ class CategoryEncoder:
         return encoder
 
 
-class RangeBasedCalibrator:
-    """Custom calibrator that applies different calibration strategies to different probability ranges"""
-
-    def __init__(self, ranges: Optional[List[float]] = None, method: str = 'isotonic', out_of_bounds: str = 'clip'):
-        self.ranges = [0.33, 0.67] if ranges is None else ranges
-        self.method = method
-        self.out_of_bounds = out_of_bounds
-        self.calibrators = {}
-        self.min_probs = {}
-        self.max_probs = {}
-
-    def _get_region(self, prob: float) -> str:
-        """Determine which region a probability belongs to"""
-        if prob < self.ranges[0]:
-            return 'low'
-        elif prob > self.ranges[-1]:
-            return 'high'
-        else:
-            for i in range(len(self.ranges) - 1):
-                if self.ranges[i] <= prob <= self.ranges[i + 1]:
-                    return f'mid_{i}'
-            return 'mid_0'
-
-    def fit(self, probs: np.ndarray, y_true: np.ndarray) -> 'RangeBasedCalibrator':
-        """Fit calibration models for each probability region"""
-        all_regions = ['low'] + [f'mid_{i}' for i in range(len(self.ranges) - 1)] + ['high']
-
-        # Create masks for each region
-        region_masks = {
-            'low': probs < self.ranges[0],
-            'high': probs > self.ranges[-1]
-        }
-
-        for i in range(len(self.ranges) - 1):
-            region_masks[f'mid_{i}'] = (probs >= self.ranges[i]) & (probs <= self.ranges[i + 1])
-
-        # Fit calibrators for each region
-        for region in all_regions:
-            mask = region_masks[region]
-
-            if np.sum(mask) < 10:  # Skip regions with too few samples
-                continue
-
-            region_probs = probs[mask]
-            region_y = y_true[mask]
-
-            self.min_probs[region] = np.min(region_probs) if len(region_probs) > 0 else 0
-            self.max_probs[region] = np.max(region_probs) if len(region_probs) > 0 else 1
-
-            if self.method == 'isotonic':
-                self.calibrators[region] = IsotonicRegression(out_of_bounds=self.out_of_bounds)
-                self.calibrators[region].fit(region_probs, region_y)
-            elif self.method == 'sigmoid':
-                lr = LogisticRegression(C=1.0)
-                lr.fit(region_probs.reshape(-1, 1), region_y)
-                self.calibrators[region] = lr
-            else:
-                raise ValueError(f"Unknown calibration method: {self.method}")
-
-        return self
-
-    def transform(self, probs: np.ndarray) -> np.ndarray:
-        """Apply calibration transformation to new probabilities"""
-        calibrated_probs = np.zeros_like(probs)
-
-        for i, prob in enumerate(probs):
-            region = self._get_region(prob)
-
-            # If calibrator for this region doesn't exist, use the closest one
-            if region not in self.calibrators:
-                available_regions = list(self.calibrators.keys())
-                if len(available_regions) == 0:
-                    calibrated_probs[i] = prob
-                    continue
-
-                # Find closest region
-                region_values = {
-                    'low': self.ranges[0] / 2,
-                    'high': (1 + self.ranges[-1]) / 2
-                }
-                for j in range(len(self.ranges) - 1):
-                    region_values[f'mid_{j}'] = (self.ranges[j] + self.ranges[j + 1]) / 2
-
-                current_region_value = region_values.get(region, 0.5)
-                region = min(available_regions, key=lambda r: abs(region_values.get(r, 0.5) - current_region_value))
-
-            # Apply calibration
-            if self.method == 'isotonic':
-                calibrated_probs[i] = self.calibrators[region].predict([prob])[0]
-            elif self.method == 'sigmoid':
-                if self.out_of_bounds == 'clip':
-                    prob = np.clip(prob, self.min_probs[region], self.max_probs[region])
-                calibrated_probs[i] = self.calibrators[region].predict_proba([[prob]])[0, 1]
-
-        return calibrated_probs
-
-
 class ModelManager:
     """Manages model loading, calibration, and predictions"""
 
@@ -223,7 +127,38 @@ class ModelManager:
         self.encoder = None
 
     def load_models(self) -> List[Any]:
-        """Load trained models from disk"""
+        """Load trained models from disk
+
+        Behavior:
+        - If config.model_dir is set: load all files in that folder whose names
+          match config.model_filename_pattern (e.g., '^run\\d.*\\.json$').
+        - Else: fall back to prior behavior using model_files (and use_ensemble flag).
+        """
+        self.models = []
+
+        # --- New folder auto-discovery path ---
+        if self.config.model_dir:
+            folder = os.path.abspath(self.config.model_dir)
+            if not os.path.isdir(folder):
+                raise FileNotFoundError(f"Model directory not found: {folder}")
+
+            pattern = re.compile(self.config.model_filename_pattern)
+            candidates = [
+                os.path.join(folder, f)
+                for f in os.listdir(folder)
+                if pattern.match(f)
+            ]
+            if not candidates:
+                raise FileNotFoundError(
+                    f"No model files in {folder} matching pattern {self.config.model_filename_pattern}"
+                )
+
+            # Load all discovered models (ensemble)
+            for path in sorted(candidates):
+                self.models.append(self._load_single_model(path))
+            return self.models
+
+        # --- Original behavior (explicit list) ---
         if self.config.use_ensemble:
             for model_file in self.config.model_files:
                 model_path = os.path.abspath(f"{self.config.model_base_path}/{model_file}")
@@ -270,10 +205,8 @@ class ModelManager:
         if not self.config.use_calibration:
             return self._get_uncalibrated_predictions(X_test)
 
-        if self.config.calibration_type == 'range_based':
-            return self._apply_range_calibration(X_val, y_val, X_test)
-        else:
-            return self._apply_standard_calibration(X_val, y_val, X_test)
+        # Only standard calibration remains (isotonic or sigmoid via CalibratedClassifierCV)
+        return self._apply_standard_calibration(X_val, y_val, X_test)
 
     def _get_uncalibrated_predictions(self, X_test: pd.DataFrame) -> List[np.ndarray]:
         """Get uncalibrated predictions from models"""
@@ -286,28 +219,7 @@ class ModelManager:
             y_pred_proba_list.append(np.array(predictions))
         return y_pred_proba_list
 
-    def _apply_range_calibration(self, X_val: pd.DataFrame, y_val: pd.Series, X_test: pd.DataFrame) -> List[np.ndarray]:
-        """Apply range-based calibration"""
-        y_pred_proba_list = []
-
-        for model in self.models:
-            val_probs = model.predict_proba(X_val)[:, 1]
-            calibrator = RangeBasedCalibrator(ranges=self.config.range_calibration_ranges, method='isotonic')
-            calibrator.fit(val_probs, y_val)
-
-            test_probs_raw = model.predict_proba(X_test)
-            calibrated_probs_class1 = calibrator.transform(test_probs_raw[:, 1])
-
-            calibrated_probs = np.zeros_like(test_probs_raw)
-            calibrated_probs[:, 1] = calibrated_probs_class1
-            calibrated_probs[:, 0] = 1 - calibrated_probs_class1
-
-            y_pred_proba_list.append(calibrated_probs)
-
-        return y_pred_proba_list
-
-    def _apply_standard_calibration(self, X_val: pd.DataFrame, y_val: pd.Series, X_test: pd.DataFrame) -> List[
-        np.ndarray]:
+    def _apply_standard_calibration(self, X_val: pd.DataFrame, y_val: pd.Series, X_test: pd.DataFrame) -> List[np.ndarray]:
         """Apply standard isotonic or sigmoid calibration"""
         calibrated_models = []
         for model in self.models:
@@ -439,15 +351,16 @@ def print_overall_metrics(y_test: pd.Series, y_pred: np.ndarray, y_pred_proba: n
 
 if __name__ == "__main__":
     # Run with default configuration
-    main()
+    # main()
 
     # Or customize configuration:
-    # custom_config = Config(
-    #     manual_threshold=0.55,
-    #     use_calibration=True,
-    #     calibration_type='range_based',
-    #     initial_bankroll=5000,
-    #     kelly_fraction=0.25,
-    #     fixed_bet_fraction=0.05
-    # )
-    # main(custom_config)
+    custom_config = Config(
+        manual_threshold=0.50,
+        use_calibration=True,
+        calibration_type='isotonic',
+        initial_bankroll=10000,
+        kelly_fraction=0.5,
+        fixed_bet_fraction=0.1,
+        model_dir='../../../saved_models/xgboost/new_features_15y2/',  # <--- use folder
+    )
+    main(custom_config)
