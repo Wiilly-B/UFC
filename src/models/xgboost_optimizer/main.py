@@ -18,6 +18,11 @@ SHOW_TRIAL_PLOTS = False     # False -> DO NOT spam per-trial plots (keep only f
 FEATURE_PREVIEW_N = 30       # how many of the selected features to print (preview)
 # --------------------------------------------
 
+# ---- Feature selection toggle ----
+USE_TOP_K_FEATURES = True    # True -> select top K features on each outer train split; False -> use all features
+TOP_K_FEATURES = 300         # K in "top K"
+# ----------------------------------
+
 import matplotlib
 if not SHOW_PLOTS:
     matplotlib.use("Agg")  # headless only when not showing
@@ -34,17 +39,14 @@ warnings.filterwarnings("ignore")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data" / "train_test"
 SAVE_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "trials"
-FINAL_MODEL_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "300_features_high_reg"
+FINAL_MODEL_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "high_reg_no_odds_300"
 TRIAL_PLOTS_DIR = SAVE_DIR / "trial_plots"
 
 ACC_THRESHOLD = 0.50
 VAL_ACC_SAVE_THRESHOLD = 0.50
 LOSS_GAP_THRESHOLD = 1
 
-INCLUDE_ODDS_COLUMNS = False
-
-# Limit to top-K features to combat "many features, little data"
-TOP_K_FEATURES = 300  # <- tweak here
+INCLUDE_ODDS_COLUMNS = False  # when False, we drop odds/open/closing-related columns
 
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -176,6 +178,7 @@ def load_data_for_cv(train_path: str | Path | None = None,
     drop_cols = ["winner", "fighter_a", "fighter_b", "date"]
 
     if not include_odds:
+        # drop any column that looks odds-related (odds/open/closing etc.)
         odds_terms = ("odd", "open", "opening", "close", "closing")
         odds_cols = [c for c in df.columns if any(term in c.lower() for term in odds_terms)]
         drop_cols.extend(odds_cols)
@@ -262,18 +265,29 @@ def clean_data_for_xgboost(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame,
     return X, y
 
 
-# ==================== FEATURE SELECTION (UPDATED) ====================
+# ==================== FEATURE SELECTION (TOGGLEABLE) ====================
 
-def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series, k: int = TOP_K_FEATURES) -> tuple[list[str], list[str]]:
+def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series,
+                               k: int = TOP_K_FEATURES,
+                               enabled: bool = USE_TOP_K_FEATURES) -> tuple[list[str], list[str]]:
     """
-    Train a quick XGBoost model on the OUTER TRAINING SPLIT ONLY and select top-k
-    features by gain importance. Returns (selected_cols, full_ranking_by_gain).
+    When enabled=True:
+      - Train a quick XGBoost on the OUTER TRAINING SPLIT ONLY and select top-k features by gain.
+    When enabled=False:
+      - Return all columns unchanged (no selection).
 
-    Why this avoids leakage:
-      - The selector sees only the outer-train partition and never the outer-test.
-      - So the choice of features isn't biased by the outer-test labels.
+    Returns (selected_cols, full_ranking_by_gain_or_all_cols).
     """
-    print(f"\n[Feature Selection] Fitting quick XGBoost on outer-train to select top {k} features...")
+    if not enabled:
+        cols = list(X_tr.columns)
+        print(f"\n[Feature Selection] DISABLED → using ALL {len(cols)} features.")
+        if FEATURE_PREVIEW_N > 0:
+            preview = cols[:min(FEATURE_PREVIEW_N, len(cols))]
+            print(f"[Feature Preview] First {len(preview)} columns:")
+            print("  " + ", ".join(preview))
+        return cols, cols
+
+    print(f"\n[Feature Selection] ENABLED → fitting quick XGBoost to select top {k} features...")
     params = {
         "objective": "binary:logistic",
         "tree_method": "hist",
@@ -285,6 +299,7 @@ def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series, k: int = TOP
         "subsample": 0.9,
         "colsample_bytree": 0.9,
         "eval_metric": "logloss",
+        "verbosity": 0,
     }
     fs_model = xgb.XGBClassifier(**params)
     fs_model.fit(X_tr, y_tr, verbose=False)
@@ -313,7 +328,6 @@ def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series, k: int = TOP
         selected_cols = [c for c in X_tr.columns if c in top_set]
 
     print(f"[Feature Selection] Selected {len(selected_cols)} features.")
-    # Print a preview of the top features (by gain)
     if FEATURE_PREVIEW_N > 0:
         preview = full_rank[:min(FEATURE_PREVIEW_N, len(full_rank))]
         print(f"[Feature Preview] Top {len(preview)} (by gain):")
@@ -483,8 +497,10 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
         print(f"  Training period:   {dates_tr.min().date()} to {dates_tr.max().date()} ({len(X_tr)} samples)")
         print(f"  Test period:       {dates_te.min().date()} to {dates_te.max().date()} ({len(X_te)} samples)")
 
-        # Select top-K features using ONLY outer-train split, then restrict X_tr/X_te
-        selected_cols, full_rank = select_top_features_by_xgb(X_tr, y_tr, k=TOP_K_FEATURES)
+        # Select top-K features using ONLY outer-train split (or keep all if disabled)
+        selected_cols, full_rank = select_top_features_by_xgb(
+            X_tr, y_tr, k=TOP_K_FEATURES, enabled=USE_TOP_K_FEATURES
+        )
         X_tr = X_tr[selected_cols].copy()
         X_te = X_te[selected_cols].copy()
 
@@ -526,7 +542,6 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
 
                 model = xgb.XGBClassifier(**params)
 
-                # prune on the validation logloss (2nd tuple in eval_set → "validation_1")
                 prune_cb = XGBoostPruningCallback(trial, "validation_1-logloss")
 
                 model.fit(
@@ -546,7 +561,6 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
                 train_error_curves.append(evals_result["validation_0"]["error"])
                 val_error_curves.append(evals_result["validation_1"]["error"])
 
-            # Optional per-trial visualization (disabled by default)
             plot_trial_metrics(
                 train_logloss_curves,
                 val_logloss_curves,
@@ -686,8 +700,10 @@ def train_final_model_on_all_data(X, y, dates, aggregated_params, median_n_estim
     print(f"  RUN {run_number} | TRAINING FINAL MODEL")
     print("=" * 70)
 
-    # Select top-K features on ALL data (for final prod model)
-    final_selected_cols, final_full_rank = select_top_features_by_xgb(X, y, k=TOP_K_FEATURES)
+    # Select top-K features on ALL data (or keep all if disabled)
+    final_selected_cols, final_full_rank = select_top_features_by_xgb(
+        X, y, k=TOP_K_FEATURES, enabled=USE_TOP_K_FEATURES
+    )
     X = X[final_selected_cols].copy()
 
     final_params = {
