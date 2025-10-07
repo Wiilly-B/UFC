@@ -1,4 +1,4 @@
-"""UFC Fight Prediction - XGBoost training with walk-forward nested cross-validation."""
+"""UFC Fight Prediction - XGBoost training with walk-forward nested cross-validation and pause/resume."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 import random
+import threading
+import time
 
 import matplotlib
 
@@ -24,14 +26,13 @@ warnings.filterwarnings("ignore")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data" / "train_test"
 SAVE_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "trials"
-FINAL_MODEL_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "new_features_15y2"
+FINAL_MODEL_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "new_features_15y_100"
 TRIAL_PLOTS_DIR = SAVE_DIR / "trial_plots"
 
 ACC_THRESHOLD = 0.50
 VAL_ACC_SAVE_THRESHOLD = 0.50
 LOSS_GAP_THRESHOLD = 1
 
-# Configuration: Set to False to drop all columns containing "odd" in their name
 INCLUDE_ODDS_COLUMNS = False
 
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,14 +40,113 @@ FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 TRIAL_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ==================== PAUSE/RESUME CONTROL ====================
+
+class TrainingController:
+    """Controls pause/resume functionality for training."""
+
+    def __init__(self):
+        self.paused = False
+        self.should_stop = False
+        self.pause_lock = threading.Lock()
+        self.listener_thread = None
+        self.running = False
+
+    def start_listener(self):
+        """Start control listener in background thread."""
+        if self.listener_thread is not None and self.listener_thread.is_alive():
+            return
+
+        print("\n" + "="*70)
+        print("  TRAINING CONTROLS ACTIVE")
+        print("  Type 'p' and press ENTER to PAUSE")
+        print("  Type 'r' and press ENTER to RESUME")
+        print("  Type 'q' and press ENTER to QUIT after current operation")
+        print("="*70 + "\n")
+
+        self.running = True
+        self.listener_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
+        self.listener_thread.start()
+
+    def _keyboard_listener(self):
+        """Listen for keyboard input."""
+        while self.running:
+            try:
+                command = input().strip().lower()
+
+                if command == 'p':
+                    self._handle_pause()
+                elif command == 'r':
+                    self._handle_resume()
+                elif command == 'q':
+                    self._handle_quit()
+                elif command:
+                    print(f"[Unknown: '{command}'] Valid commands: p, r, q")
+
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception:
+                pass
+
+    def _handle_pause(self):
+        """Handle pause signal."""
+        with self.pause_lock:
+            if not self.paused:
+                self.paused = True
+                print("\n" + "="*70)
+                print("  ⏸️  TRAINING PAUSED")
+                print("  Type 'r' and press ENTER to RESUME")
+                print("  Type 'q' and press ENTER to QUIT")
+                print("="*70 + "\n")
+
+    def _handle_resume(self):
+        """Handle resume signal."""
+        with self.pause_lock:
+            if self.paused:
+                self.paused = False
+                print("\n" + "="*70)
+                print("  ▶️  TRAINING RESUMED")
+                print("="*70 + "\n")
+            else:
+                print("[Info] Training is not paused")
+
+    def _handle_quit(self):
+        """Handle quit signal."""
+        with self.pause_lock:
+            if not self.should_stop:
+                self.should_stop = True
+                print("\n" + "="*70)
+                print("  🛑 QUIT REQUESTED - Will stop after current operation")
+                print("="*70 + "\n")
+
+    def check_pause(self):
+        """Check if training should pause. Blocks until resumed."""
+        while True:
+            with self.pause_lock:
+                if self.should_stop:
+                    raise KeyboardInterrupt("Training stopped by user")
+                if not self.paused:
+                    break
+            time.sleep(0.5)
+
+    def stop(self):
+        """Stop the listener thread."""
+        self.running = False
+        if self.listener_thread is not None:
+            self.listener_thread.join(timeout=1.0)
+
+
+# Global training controller
+training_controller = TrainingController()
+
+
+# ==================== ORIGINAL FUNCTIONS WITH PAUSE POINTS ====================
+
 def load_data_for_cv(train_path: str | Path | None = None,
                      val_path: str | Path | None = None,
                      include_odds: bool = True,
                      date_column: str = 'current_fight_date'):
-    """
-    Combine train and validation data for walk-forward nested cross-validation.
-    Keeps date column for chronological sorting.
-    """
+    """Combine train and validation data for walk-forward nested cross-validation."""
     from pandas.api.types import CategoricalDtype
 
     train_path = Path(train_path) if train_path is not None else DATA_DIR / "train_data.csv"
@@ -56,18 +156,14 @@ def load_data_for_cv(train_path: str | Path | None = None,
     val_df = pd.read_csv(val_path)
     df = pd.concat([train_df, val_df], ignore_index=True)
 
-    # Ensure date column exists
     if date_column not in df.columns:
         raise ValueError(f"Date column '{date_column}' not found in data. Available columns: {df.columns.tolist()}")
 
-    # Convert date column to datetime and sort chronologically
     df[date_column] = pd.to_datetime(df[date_column])
     df = df.sort_values(date_column).reset_index(drop=True)
 
     drop_cols = ["winner", "fighter_a", "fighter_b", "date"]
-    # Keep date_column for now, will separate it later
 
-    # Optionally drop odds columns
     if not include_odds:
         odds_cols = [c for c in df.columns if "odd" in c.lower()]
         drop_cols.extend(odds_cols)
@@ -91,62 +187,46 @@ def load_data_for_cv(train_path: str | Path | None = None,
     if obj_cols:
         print(f"Categorical cols: {obj_cols}")
 
-    # Clean data to remove inf/NaN values
     X, y = clean_data_for_xgboost(X, y)
 
     return X, y, dates
 
 
 def clean_data_for_xgboost(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Clean data to remove inf, NaN, and extremely large values that cause XGBoost errors.
-
-    Args:
-        X: Feature DataFrame
-        y: Target Series
-
-    Returns:
-        Cleaned X and y
-    """
+    """Clean data to remove inf, NaN, and extremely large values."""
     print("\n" + "=" * 70)
     print("DATA CLEANING FOR XGBOOST")
     print("=" * 70)
 
     initial_shape = X.shape
 
-    # 1. Check for inf values
     inf_mask = np.isinf(X.select_dtypes(include=[np.number]).values).any(axis=1)
     n_inf = inf_mask.sum()
     if n_inf > 0:
         print(f"  Found {n_inf} rows with inf values")
-        # Replace inf with NaN first
         X = X.replace([np.inf, -np.inf], np.nan)
 
-    # 2. Check for NaN values
     nan_counts = X.isna().sum()
     cols_with_nan = nan_counts[nan_counts > 0]
     if len(cols_with_nan) > 0:
         print(f"  Found NaN values in {len(cols_with_nan)} columns")
         print(f"  Total NaN values: {nan_counts.sum()}")
 
-        # For numeric columns, fill NaN with median
         numeric_cols = X.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             if X[col].isna().any():
                 median_val = X[col].median()
-                if pd.isna(median_val):  # If all values are NaN, use 0
+                if pd.isna(median_val):
                     median_val = 0
                 X[col].fillna(median_val, inplace=True)
 
-        # For categorical columns, fill with mode or '<NA>'
         cat_cols = X.select_dtypes(include=['category']).columns
         for col in cat_cols:
             if X[col].isna().any():
                 X[col].fillna('<NA>', inplace=True)
 
-    # 3. Clip extremely large values (beyond float32 range)
     numeric_cols = X.select_dtypes(include=[np.number]).columns
-    max_val = np.finfo(np.float32).max / 10  # Use 1/10th of float32 max for safety
+    max_val = np.finfo(np.float32).max / 10
     min_val = np.finfo(np.float32).min / 10
 
     clipped_cols = []
@@ -159,9 +239,7 @@ def clean_data_for_xgboost(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame,
 
     if clipped_cols:
         print(f"  Clipped {len(clipped_cols)} columns with extreme values")
-        print(f"  Clipped range: [{min_val:.2e}, {max_val:.2e}]")
 
-    # 4. Final validation
     assert not X.isna().any().any(), "NaN values still present after cleaning"
     assert not np.isinf(X.select_dtypes(include=[np.number]).values).any(), "Inf values still present after cleaning"
 
@@ -173,17 +251,7 @@ def clean_data_for_xgboost(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame,
 
 
 def get_walk_forward_splits(n_samples: int, n_splits: int = 5, min_train_ratio: float = 0.5):
-    """
-    Generate walk-forward (expanding window) splits for time series cross-validation.
-
-    Args:
-        n_samples: Total number of samples
-        n_splits: Number of folds
-        min_train_ratio: Minimum ratio of data to use for first training set
-
-    Returns:
-        List of (train_indices, test_indices) tuples
-    """
+    """Generate walk-forward (expanding window) splits."""
     min_train_size = int(n_samples * min_train_ratio)
     remaining_samples = n_samples - min_train_size
     test_size = remaining_samples // n_splits
@@ -194,7 +262,6 @@ def get_walk_forward_splits(n_samples: int, n_splits: int = 5, min_train_ratio: 
         test_start = train_end
         test_end = min(test_start + test_size, n_samples)
 
-        # Ensure we have at least some test samples
         if test_end <= test_start:
             continue
 
@@ -209,7 +276,7 @@ def get_walk_forward_splits(n_samples: int, n_splits: int = 5, min_train_ratio: 
 def plot_trial_metrics(train_logloss_curves, val_logloss_curves,
                        train_error_curves, val_error_curves,
                        plot_path: Path, trial_number: int, outer_fold: int) -> None:
-    """Plot aggregated loss and accuracy curves for an Optuna trial."""
+    """Plot aggregated loss and accuracy curves."""
     if not train_logloss_curves or not val_logloss_curves:
         return
 
@@ -274,10 +341,9 @@ def plot_trial_metrics(train_logloss_curves, val_logloss_curves,
 
 
 def aggregate_best_params(best_params_per_fold):
-    """Aggregate hyperparameters from all folds by taking median/mode."""
+    """Aggregate hyperparameters from all folds."""
     aggregated = {}
 
-    # Get all parameter names
     param_names = set()
     for params in best_params_per_fold:
         param_names.update(params.keys())
@@ -285,11 +351,9 @@ def aggregate_best_params(best_params_per_fold):
     for param_name in param_names:
         values = [params[param_name] for params in best_params_per_fold]
 
-        # Use median for numeric parameters
         if isinstance(values[0], (int, float)):
             aggregated[param_name] = type(values[0])(np.median(values))
         else:
-            # Use mode for categorical
             from collections import Counter
             aggregated[param_name] = Counter(values).most_common(1)[0][0]
 
@@ -299,19 +363,12 @@ def aggregate_best_params(best_params_per_fold):
 def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
                            optuna_trials: int = 100, save_models: bool = True,
                            run_number: int = 1, include_odds: bool = True):
-    """
-    Run walk-forward nested cross-validation.
-    Respects chronological order - never trains on future to predict past.
-
-    Outer loop: Expanding window for model evaluation
-    Inner loop: Walk-forward for hyperparameter tuning (within each outer training set)
-    """
+    """Run walk-forward nested cross-validation with pause/resume."""
     print("\n" + "=" * 70)
     print(f"RUN {run_number} | Walk-Forward Nested CV")
     print(f"Outer folds: {outer_cv} | Inner folds: {inner_cv} | Optuna trials: {optuna_trials}")
     print("=" * 70)
 
-    # Get outer walk-forward splits (expanding window)
     outer_splits = get_walk_forward_splits(len(X), n_splits=outer_cv, min_train_ratio=0.5)
 
     outer_accs, outer_aucs = [], []
@@ -322,6 +379,8 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     for fold_idx, (tr_idx, te_idx) in enumerate(outer_splits, start=1):
+        training_controller.check_pause()
+
         print(f"\n{'='*70}")
         print(f"  RUN {run_number} | OUTER FOLD {fold_idx}/{len(outer_splits)}")
         print(f"{'='*70}")
@@ -330,18 +389,22 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
         y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
         dates_tr, dates_te = dates.iloc[tr_idx], dates.iloc[te_idx]
 
-        # Print date ranges
         print(f"  Training period:   {dates_tr.min().date()} to {dates_tr.max().date()} ({len(X_tr)} samples)")
         print(f"  Test period:       {dates_te.min().date()} to {dates_te.max().date()} ({len(X_te)} samples)")
 
-        # Get inner walk-forward splits for hyperparameter tuning
         inner_splits = get_walk_forward_splits(len(X_tr), n_splits=inner_cv, min_train_ratio=0.6)
 
         fold_plot_dir = TRIAL_PLOTS_DIR / f"run{run_number}_outer_fold_{fold_idx:02d}"
         fold_plot_dir.mkdir(parents=True, exist_ok=True)
 
+        trial_count = [0]
+
         def inner_objective(trial: optuna.Trial) -> float:
-            """Objective function for Optuna hyperparameter optimization."""
+            """Objective function with pause check."""
+            trial_count[0] += 1
+            if trial_count[0] % 5 == 0:
+                training_controller.check_pause()
+
             params = {
                 "objective": "binary:logistic",
                 "tree_method": "hist",
@@ -364,7 +427,6 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
             train_logloss_curves, val_logloss_curves = [], []
             train_error_curves, val_error_curves = [], []
 
-            # Evaluate on inner walk-forward splits
             for in_tr_idx, in_va_idx in inner_splits:
                 X_in_tr, X_in_va = X_tr.iloc[in_tr_idx], X_tr.iloc[in_va_idx]
                 y_in_tr, y_in_va = y_tr.iloc[in_tr_idx], y_tr.iloc[in_va_idx]
@@ -399,7 +461,6 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
 
             return float(np.mean(fold_aucs))
 
-        # Optimize hyperparameters using inner walk-forward CV
         study = optuna.create_study(
             direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=random.randint(0, 100000))
@@ -409,12 +470,9 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
         best_params = dict(study.best_params)
         best_params_per_fold.append(best_params)
         print(f"\n  Inner CV Best AUC: {study.best_value:.4f}")
-        print(f"  Best hyperparameters found:")
-        for key, value in best_params.items():
-            print(f"    {key}: {value}")
 
-        # Train final model for this fold with best hyperparameters
-        # Use last 15% of training data as validation for early stopping
+        training_controller.check_pause()
+
         val_split_point = int(len(X_tr) * 0.85)
         X_tr2, X_va2 = X_tr.iloc[:val_split_point], X_tr.iloc[val_split_point:]
         y_tr2, y_va2 = y_tr.iloc[:val_split_point], y_tr.iloc[val_split_point:]
@@ -437,7 +495,6 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
             verbose=False,
         )
 
-        # Get metrics at best iteration
         evals_result = final_model.evals_result()
         train_loss_curve = evals_result["validation_0"]["logloss"]
         val_loss_curve = evals_result["validation_1"]["logloss"]
@@ -460,18 +517,15 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
         )
         best_n_per_fold.append(int(best_n_estimators))
 
-        # Retrain on full outer training set with optimal n_estimators
         final_model = xgb.XGBClassifier(
             **{**final_params, "n_estimators": int(best_n_estimators), "early_stopping_rounds": None}
         )
         final_model.fit(X_tr, y_tr, verbose=False)
 
-        # Evaluate on outer test set (future data)
         te_proba = final_model.predict_proba(X_te)[:, 1]
         te_acc = accuracy_score(y_te, (te_proba > 0.5).astype(int))
         te_auc = roc_auc_score(y_te, te_proba)
 
-        # Evaluate on outer training set
         tr_proba = final_model.predict_proba(X_tr)[:, 1]
         tr_acc = accuracy_score(y_tr, (tr_proba > 0.5).astype(int))
         tr_auc = roc_auc_score(y_tr, tr_proba)
@@ -481,21 +535,8 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
         train_accs.append(tr_acc)
         train_aucs.append(tr_auc)
 
-        # Print comprehensive fold statistics
-        print(f"\n  {'─'*66}")
-        print(f"  FOLD {fold_idx} RESULTS")
-        print(f"  {'─'*66}")
-        print(f"  Optimal n_estimators: {best_n_estimators}")
-        print(f"\n  Holdout Validation (from early stopping):")
-        print(f"    Train ACC:      {train_acc_at_best:.4f} | Loss: {train_loss_at_best:.4f}")
-        print(f"    Val ACC:        {val_acc_at_best:.4f} | Loss: {val_loss_at_best:.4f}")
-        print(f"    Loss Gap:       {loss_gap:+.4f} (abs: {loss_gap_abs:.4f})")
-        print(f"\n  Outer Split Performance (Future Prediction):")
-        print(f"    Train ACC:      {tr_acc:.4f} | AUC: {tr_auc:.4f}")
-        print(f"    Test ACC:       {te_acc:.4f} | AUC: {te_auc:.4f}")
-        print(f"  {'─'*66}")
+        print(f"\n  FOLD {fold_idx} | Test ACC: {te_acc:.4f} | Test AUC: {te_auc:.4f}")
 
-        # Save model if it meets quality thresholds
         if (
             save_models
             and val_acc_at_best >= ACC_THRESHOLD
@@ -512,37 +553,17 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
                 "fold": fold_idx,
                 "validation_method": "walk_forward",
                 "include_odds": include_odds,
-                "date_ranges": {
-                    "train_start": str(dates_tr.min().date()),
-                    "train_end": str(dates_tr.max().date()),
-                    "test_start": str(dates_te.min().date()),
-                    "test_end": str(dates_te.max().date()),
-                },
-                "params": {**final_params, "n_estimators": int(best_n_estimators), "early_stopping_rounds": None},
                 "metrics": {
-                    "train_holdout_acc": float(train_acc_at_best),
-                    "train_holdout_loss": float(train_loss_at_best),
-                    "val_holdout_acc": float(val_acc_at_best),
-                    "val_holdout_loss": float(val_loss_at_best),
-                    "loss_gap": float(loss_gap),
-                    "loss_gap_abs": float(loss_gap_abs),
-                    "train_acc": float(tr_acc),
-                    "train_auc": float(tr_auc),
                     "test_acc": float(te_acc),
                     "test_auc": float(te_auc),
                 },
             }
             metadata_path.write_text(json.dumps(metadata, indent=2))
-            print(f"\n  ✓ Saved fold model | val_acc={val_acc_at_best:.3f}, loss_gap={loss_gap_abs:.3f}")
 
     print("\n" + "=" * 70)
-    print(f"  RUN {run_number} | WALK-FORWARD NESTED CV RESULTS")
-    print(f"  (Unbiased Performance Estimate on Future Data)")
-    print("=" * 70)
+    print(f"  RUN {run_number} | RESULTS")
     print(f"  Test Accuracy:  {np.mean(outer_accs):.4f} ± {np.std(outer_accs):.4f}")
     print(f"  Test AUC:       {np.mean(outer_aucs):.4f} ± {np.std(outer_aucs):.4f}")
-    print(f"  Train Accuracy: {np.mean(train_accs):.4f} ± {np.std(train_accs):.4f}")
-    print(f"  Train AUC:      {np.mean(train_aucs):.4f} ± {np.std(train_aucs):.4f}")
     print("=" * 70)
 
     return {
@@ -557,12 +578,12 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
 
 def train_final_model_on_all_data(X, y, dates, aggregated_params, median_n_estimators,
                                   run_number, include_odds):
-    """Train final production model on all available data."""
+    """Train final production model."""
+    training_controller.check_pause()
+
     print("\n" + "=" * 70)
-    print(f"  RUN {run_number} | TRAINING FINAL MODEL ON ALL DATA")
+    print(f"  RUN {run_number} | TRAINING FINAL MODEL")
     print("=" * 70)
-    print(f"  Date range: {dates.min().date()} to {dates.max().date()}")
-    print(f"  Total samples: {len(X)}")
 
     final_params = {
         "objective": "binary:logistic",
@@ -571,28 +592,19 @@ def train_final_model_on_all_data(X, y, dates, aggregated_params, median_n_estim
         "enable_categorical": True,
         "n_estimators": int(median_n_estimators),
         "eval_metric": ["logloss", "error"],
-        "early_stopping_rounds": None,  # No early stopping for final model
+        "early_stopping_rounds": None,
         **aggregated_params,
     }
-
-    print(f"\n  Training with aggregated hyperparameters:")
-    for key, value in aggregated_params.items():
-        print(f"    {key}: {value}")
-    print(f"    n_estimators: {median_n_estimators}")
 
     final_model = xgb.XGBClassifier(**final_params)
     final_model.fit(X, y, verbose=False)
 
-    # Evaluate on training data (for reference only)
     train_proba = final_model.predict_proba(X)[:, 1]
     train_acc = accuracy_score(y, (train_proba > 0.5).astype(int))
     train_auc = roc_auc_score(y, train_proba)
 
-    print(f"\n  Final Model Training Metrics:")
-    print(f"    Train ACC: {train_acc:.4f}")
-    print(f"    Train AUC: {train_auc:.4f}")
-    print(f"    (Note: These are on training data, not test performance)")
-    print(f"    (Expected test performance from walk-forward CV is the true estimate)")
+    print(f"  Train ACC: {train_acc:.4f} | Train AUC: {train_auc:.4f}")
+    print("=" * 70)
 
     return final_model, final_params, train_acc, train_auc
 
@@ -600,16 +612,13 @@ def train_final_model_on_all_data(X, y, dates, aggregated_params, median_n_estim
 def train_xgboost_walkforward(optuna_trials: int = 100, outer_cv: int = 5,
                               inner_cv: int = 3, save_models: bool = True,
                               run_number: int = 1, include_odds: bool = True) -> dict:
-    """Entry point for running walk-forward nested cross-validation and training final model."""
+    """Entry point for walk-forward training."""
     print("=" * 70)
-    print(f"  RUN {run_number} | XGBoost Training - Walk-Forward Nested CV")
-    print(f"  Include Odds Columns: {include_odds}")
-    print(f"  Validation Method: WALK-FORWARD (No Data Leakage)")
+    print(f"  RUN {run_number} | XGBoost Walk-Forward Training")
     print("=" * 70)
 
     X, y, dates = load_data_for_cv(include_odds=include_odds)
 
-    # Run walk-forward nested cross-validation
     results = walk_forward_nested_cv(
         X,
         y,
@@ -622,83 +631,22 @@ def train_xgboost_walkforward(optuna_trials: int = 100, outer_cv: int = 5,
         include_odds=include_odds,
     )
 
-    # Save nested CV summary
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary_path = SAVE_DIR / f"run{run_number}_walkforward_cv_summary_{timestamp}.json"
-    summary = {
-        "run_number": run_number,
-        "validation_method": "walk_forward_nested_cv",
-        "date_range": {
-            "start": str(dates.min().date()),
-            "end": str(dates.max().date()),
-        },
-        "mean_test_acc": float(np.mean(results["outer_accs"])),
-        "std_test_acc": float(np.std(results["outer_accs"])),
-        "mean_test_auc": float(np.mean(results["outer_aucs"])),
-        "std_test_auc": float(np.std(results["outer_aucs"])),
-        "best_params_per_fold": results["best_params_per_fold"],
-        "best_n_per_fold": results["best_n_per_fold"],
-    }
-    summary_path.write_text(json.dumps(summary, indent=2))
-    print(f"\n✓ Run {run_number} walk-forward CV summary saved")
-
-    # Aggregate best hyperparameters across all folds
     aggregated_params = aggregate_best_params(results["best_params_per_fold"])
     median_n_estimators = int(np.median(results["best_n_per_fold"]))
 
-    # Train final model on all data
     final_model, final_params, train_acc, train_auc = train_final_model_on_all_data(
         X, y, dates, aggregated_params, median_n_estimators, run_number, include_odds
     )
 
-    # Save final model
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     final_model_path = FINAL_MODEL_DIR / f"run{run_number}_final_model_{timestamp}.json"
     final_model.save_model(str(final_model_path))
 
-    # Save final model metadata
-    final_metadata = {
-        "run_number": run_number,
-        "timestamp": timestamp,
-        "validation_method": "walk_forward_nested_cv",
-        "include_odds": include_odds,
-        "date_range": {
-            "start": str(dates.min().date()),
-            "end": str(dates.max().date()),
-        },
-        "nested_cv_results": {
-            "mean_test_acc": float(np.mean(results["outer_accs"])),
-            "std_test_acc": float(np.std(results["outer_accs"])),
-            "mean_test_auc": float(np.mean(results["outer_aucs"])),
-            "std_test_auc": float(np.std(results["outer_aucs"])),
-        },
-        "aggregated_params": aggregated_params,
-        "final_params": final_params,
-        "median_n_estimators": median_n_estimators,
-        "best_n_per_fold": results["best_n_per_fold"],
-        "training_metrics": {
-            "train_acc": float(train_acc),
-            "train_auc": float(train_auc),
-        },
-        "training_samples": len(X),
-    }
-
-    final_metadata_path = FINAL_MODEL_DIR / f"run{run_number}_final_model_metadata_{timestamp}.json"
-    final_metadata_path.write_text(json.dumps(final_metadata, indent=2))
-
-    print("\n" + "=" * 70)
-    print(f"  ✓ Run {run_number} final model saved to: {final_model_path}")
-    print(f"  ✓ Metadata saved to: {final_metadata_path}")
-    print("=" * 70)
-    print(f"\n  Expected test performance (from walk-forward CV):")
-    print(f"    Accuracy: {np.mean(results['outer_accs']):.4f} ± {np.std(results['outer_accs']):.4f}")
-    print(f"    AUC:      {np.mean(results['outer_aucs']):.4f} ± {np.std(results['outer_aucs']):.4f}")
-    print("=" * 70)
+    print(f"  ✓ Model saved: {final_model_path.name}")
 
     return {
         "run_number": run_number,
-        "validation_method": "walk_forward",
         "model_path": str(final_model_path),
-        "metadata_path": str(final_metadata_path),
         "mean_test_acc": float(np.mean(results["outer_accs"])),
         "std_test_acc": float(np.std(results["outer_accs"])),
         "mean_test_auc": float(np.mean(results["outer_aucs"])),
@@ -709,46 +657,53 @@ def train_xgboost_walkforward(optuna_trials: int = 100, outer_cv: int = 5,
 def run_multiple_training_sessions(n_runs: int = 5, optuna_trials: int = 100,
                                    outer_cv: int = 5, inner_cv: int = 3,
                                    save_models: bool = True, include_odds: bool = True):
-    """Run multiple walk-forward training sessions to generate multiple final models."""
+    """Run multiple training sessions with pause/resume."""
     print("\n" + "█" * 70)
-    print("█" + " " * 68 + "█")
-    print(f"█  WALK-FORWARD NESTED CV - {n_runs} TRAINING RUNS" + " " * (68 - len(f"  WALK-FORWARD NESTED CV - {n_runs} TRAINING RUNS")) + "█")
-    print(f"█  Include Odds Columns: {include_odds}" + " " * (68 - len(f"  Include Odds Columns: {include_odds}")) + "█")
-    print(f"█  Validation: Time-aware (No Data Leakage)" + " " * 28 + "█")
-    print("█" + " " * 68 + "█")
+    print(f"█  WALK-FORWARD TRAINING - {n_runs} RUNS")
     print("█" * 70 + "\n")
+
+    training_controller.start_listener()
 
     all_run_results = []
 
-    for run_idx in range(1, n_runs + 1):
-        print(f"\n\n{'█' * 70}")
-        print(f"█  STARTING RUN {run_idx}/{n_runs}")
-        print(f"{'█' * 70}\n")
+    try:
+        for run_idx in range(1, n_runs + 1):
+            training_controller.check_pause()
 
-        run_results = train_xgboost_walkforward(
-            optuna_trials=optuna_trials,
-            outer_cv=outer_cv,
-            inner_cv=inner_cv,
-            save_models=save_models,
-            run_number=run_idx,
-            include_odds=include_odds,
-        )
+            print(f"\n{'█' * 70}")
+            print(f"█  RUN {run_idx}/{n_runs}")
+            print(f"{'█' * 70}\n")
 
-        all_run_results.append(run_results)
+            run_results = train_xgboost_walkforward(
+                optuna_trials=optuna_trials,
+                outer_cv=outer_cv,
+                inner_cv=inner_cv,
+                save_models=save_models,
+                run_number=run_idx,
+                include_odds=include_odds,
+            )
 
-        print(f"\n{'█' * 70}")
-        print(f"█  COMPLETED RUN {run_idx}/{n_runs}")
-        print(f"{'█' * 70}\n")
+            all_run_results.append(run_results)
 
-    # Save aggregate summary of all runs
+    except KeyboardInterrupt:
+        print("\n" + "=" * 70)
+        print("  TRAINING STOPPED BY USER")
+        print(f"  Completed {len(all_run_results)}/{n_runs} runs")
+        print("=" * 70)
+    finally:
+        training_controller.stop()
+
+    if not all_run_results:
+        print("\nNo runs completed.")
+        return
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    aggregate_summary_path = FINAL_MODEL_DIR / f"all_runs_walkforward_summary_{timestamp}.json"
+    summary_path = FINAL_MODEL_DIR / f"all_runs_summary_{timestamp}.json"
 
-    aggregate_summary = {
+    summary = {
         "total_runs": n_runs,
+        "completed_runs": len(all_run_results),
         "timestamp": timestamp,
-        "validation_method": "walk_forward_nested_cv",
-        "include_odds": include_odds,
         "all_runs": all_run_results,
         "aggregate_statistics": {
             "mean_test_acc": float(np.mean([r["mean_test_acc"] for r in all_run_results])),
@@ -758,39 +713,27 @@ def run_multiple_training_sessions(n_runs: int = 5, optuna_trials: int = 100,
         },
     }
 
-    aggregate_summary_path.write_text(json.dumps(aggregate_summary, indent=2))
+    summary_path.write_text(json.dumps(summary, indent=2))
 
-    # Print final summary
     print("\n" + "█" * 70)
-    print("█" + " " * 68 + "█")
-    print("█  ALL WALK-FORWARD TRAINING RUNS COMPLETED" + " " * 25 + "█")
-    print("█" + " " * 68 + "█")
-    print("█" * 70)
-    print(f"\n  Total models trained: {n_runs}")
-    print(f"  Validation method: Walk-Forward (Time-aware, No Data Leakage)")
-    print(f"\n  Aggregate Performance Across All Runs:")
-    print(f"    Mean Test Accuracy: {aggregate_summary['aggregate_statistics']['mean_test_acc']:.4f} ± "
-          f"{aggregate_summary['aggregate_statistics']['std_test_acc']:.4f}")
-    print(f"    Mean Test AUC:      {aggregate_summary['aggregate_statistics']['mean_test_auc']:.4f} ± "
-          f"{aggregate_summary['aggregate_statistics']['std_test_auc']:.4f}")
-    print(f"\n  Individual Run Results:")
-    for run_result in all_run_results:
-        print(f"    Run {run_result['run_number']}: Acc={run_result['mean_test_acc']:.4f} ± "
-              f"{run_result['std_test_acc']:.4f}, AUC={run_result['mean_test_auc']:.4f} ± "
-              f"{run_result['std_test_auc']:.4f}")
-    print(f"\n  ✓ Aggregate summary saved to: {aggregate_summary_path}")
-    print(f"  ✓ All models saved to: {FINAL_MODEL_DIR}")
-    print(f"\n  NOTE: These are honest, unbiased estimates from walk-forward CV.")
-    print(f"  Models never trained on future data to predict past data.")
-    print("\n" + "█" * 70 + "\n")
+    print("█  TRAINING COMPLETE")
+    print(f"█  Completed: {len(all_run_results)}/{n_runs} runs")
+    print(f"█  Mean Acc: {summary['aggregate_statistics']['mean_test_acc']:.4f}")
+    print(f"█  Mean AUC: {summary['aggregate_statistics']['mean_test_auc']:.4f}")
+    print("█" * 70 + "\n")
 
 
 if __name__ == "__main__":
-    run_multiple_training_sessions(
-        n_runs=5,
-        optuna_trials=20,
-        outer_cv=5,
-        inner_cv=3,
-        save_models=True,
-        include_odds=INCLUDE_ODDS_COLUMNS
-    )
+    try:
+        run_multiple_training_sessions(
+            n_runs=100,
+            optuna_trials=20,
+            outer_cv=5,
+            inner_cv=3,
+            save_models=True,
+            include_odds=INCLUDE_ODDS_COLUMNS
+        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Exiting...")
+    finally:
+        training_controller.stop()

@@ -46,13 +46,13 @@ class Config:
     odds_type: str = 'close'  # Options: 'open', 'close', 'average'
 
     # Model settings
-    use_ensemble: bool = False  # Whether to use ensemble of models
+    use_ensemble: bool = True  # Whether to use ensemble of models
     model_files: List[str] = field(default_factory=lambda: [
+        'run1_final_model_20251007_022504.json',
+        'run2_final_model_20251007_023852.json',
+        'run3_final_model_20251007_025103.json',
         'run4_final_model_20251007_030437.json',
-        'run2_final_model_20251006_140629.json',
-        'run3_final_model_20251006_141529.json',
-        'run4_final_model_20251006_142528.json',
-        'run5_final_model_20251006_143506.json'
+        'run5_final_model_20251007_031843.json'
     ])
 
     # Data paths
