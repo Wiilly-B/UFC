@@ -370,6 +370,6 @@ if __name__ == "__main__":
         initial_bankroll=10000,
         kelly_fraction=0.5,
         fixed_bet_fraction=0.1,
-        model_dir='../../../saved_models/xgboost/new_features_15y_100/',  # <--- use folder
+        model_dir='../../../saved_models/xgboost/new_features_15y_15/',  # <--- use folder
     )
     main(custom_config)

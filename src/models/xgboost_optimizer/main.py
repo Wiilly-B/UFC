@@ -176,9 +176,10 @@ def load_data_for_cv(train_path: str | Path | None = None,
     drop_cols = ["winner", "fighter_a", "fighter_b", "date"]
 
     if not include_odds:
-        odds_cols = [c for c in df.columns if "odd" in c.lower()]
+        odds_terms = ("odd", "open", "opening", "close", "closing")
+        odds_cols = [c for c in df.columns if any(term in c.lower() for term in odds_terms)]
         drop_cols.extend(odds_cols)
-        print(f"Dropping {len(odds_cols)} odds columns: {odds_cols}")
+        print(f"Dropping {len(odds_cols)} odds-related columns: {odds_cols}")
 
     feature_cols = [c for c in df.columns if c not in drop_cols and c != date_column]
 
