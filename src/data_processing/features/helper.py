@@ -2,7 +2,7 @@
 UFC Data Analysis Utilities
 
 This module contains utility classes and functions for processing UFC fight data.
-Includes integrated data leakage verification checks.
+Includes integrated data leakage verification checks and advanced feature engineering.
 """
 
 import numpy as np
@@ -32,38 +32,24 @@ class DataUtils:
             Result of division with zeros replaced by default
         """
         if isinstance(numerator, (pd.Series, pd.DataFrame)) or isinstance(denominator, (pd.Series, pd.DataFrame)):
-            # For pandas objects, use the div method and handle NaN/inf values
             result = pd.Series(numerator).div(pd.Series(denominator))
             return result.fillna(default).replace([np.inf, -np.inf], default)
         elif isinstance(numerator, np.ndarray) and isinstance(denominator, np.ndarray):
-            # For numpy arrays, use masking
             result = np.zeros_like(numerator, dtype=float)
             mask = denominator != 0
             result[mask] = numerator[mask] / denominator[mask]
             result[~mask] = default
             return result
         else:
-            # For scalar values
             return numerator / denominator if denominator != 0 else default
 
     def preprocess_data(self, ufc_stats: pd.DataFrame, fighter_stats: pd.DataFrame) -> pd.DataFrame:
-        """
-        Preprocess the UFC and fighter stats dataframes.
-
-        Args:
-            ufc_stats: DataFrame with UFC fight statistics
-            fighter_stats: DataFrame with fighter biographical data
-
-        Returns:
-            Preprocessed DataFrame
-        """
-        # Standardize fighter names and dates
+        """Preprocess the UFC and fighter stats dataframes."""
         ufc_stats['fighter'] = ufc_stats['fighter'].astype(str).str.lower()
         ufc_stats['fight_date'] = pd.to_datetime(ufc_stats['fight_date'])
         fighter_stats['name'] = fighter_stats['FIGHTER'].astype(str).str.lower().str.strip()
         fighter_stats['dob'] = fighter_stats['DOB'].replace(['--', '', 'NA', 'N/A'], np.nan).apply(DateUtils.parse_date)
 
-        # Merge fighter stats and calculate age
         ufc_stats = pd.merge(
             ufc_stats,
             fighter_stats[['name', 'dob']],
@@ -74,11 +60,9 @@ class DataUtils:
         ufc_stats['age'] = ufc_stats['age'].fillna(np.nan).round().astype(float)
         ufc_stats.loc[ufc_stats['age'] < 0, 'age'] = np.nan
 
-        # Clean data and drop unwanted columns
         ufc_stats = ufc_stats.drop(['round', 'location', 'name'], axis=1)
-        ufc_stats = ufc_stats[~ufc_stats['weight_class'].str.contains("Women's")]
+        # ufc_stats = ufc_stats[~ufc_stats['weight_class'].str.contains("Women's")]
 
-        # Convert time strings ('MM:SS') to seconds
         ufc_stats['time'] = (
                 pd.to_datetime(ufc_stats['time'], format='%M:%S').dt.minute * 60 +
                 pd.to_datetime(ufc_stats['time'], format='%M:%S').dt.second
@@ -87,15 +71,7 @@ class DataUtils:
         return ufc_stats
 
     def rename_columns_general(self, col: str) -> str:
-        """
-        Rename columns for clarity.
-
-        Args:
-            col: Column name to rename
-
-        Returns:
-            Renamed column
-        """
+        """Rename columns for clarity."""
         if 'fighter' in col and not col.startswith('fighter'):
             if 'b_fighter_b' in col:
                 return col.replace('b_fighter_b', 'fighter_b_opponent')
@@ -106,17 +82,7 @@ class DataUtils:
         return col
 
     def get_opponent(self, fighter: str, fight_id: str, ufc_stats: pd.DataFrame) -> Optional[str]:
-        """
-        Get a fighter's opponent for a specific fight.
-
-        Args:
-            fighter: Fighter name
-            fight_id: Fight ID
-            ufc_stats: UFC stats DataFrame
-
-        Returns:
-            Opponent name or None if not found
-        """
+        """Get a fighter's opponent for a specific fight."""
         fight_fighters = ufc_stats[ufc_stats['id'] == fight_id]['fighter'].unique()
         if len(fight_fighters) < 2:
             return None
@@ -128,39 +94,22 @@ class DataUtils:
         correlation_threshold: float = 0.95,
         protected_columns: Optional[List[str]] = None
     ) -> Tuple[pd.DataFrame, List[str]]:
-        """
-        Remove highly correlated features from DataFrame.
-
-        Args:
-            df: Input DataFrame
-            correlation_threshold: Correlation threshold for removal
-            protected_columns: Columns to never remove
-
-        Returns:
-            Tuple of (DataFrame without correlated features, list of removed columns)
-        """
+        """Remove highly correlated features from DataFrame."""
         protected_columns = protected_columns or []
 
-        # Select numeric columns
         numeric_columns = df.select_dtypes(include=[np.number]).columns
         numeric_df = df[numeric_columns]
 
-        # Calculate correlation matrix
         corr_matrix = numeric_df.corr().abs()
-
-        # Get upper triangle of correlation matrix
         upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
 
-        # Find columns to drop (excluding protected columns)
         columns_to_drop = [
             column for column in upper_tri.columns
             if any(upper_tri[column] > correlation_threshold)
             and column not in protected_columns
         ]
 
-        # Drop columns
         cleaned_df = df.drop(columns=columns_to_drop)
-
         return cleaned_df, columns_to_drop
 
 
@@ -172,7 +121,7 @@ class OddsUtils:
         data_dir: Optional[Union[str, Path]] = None,
         odds_filename: Union[str, Path] = "processed/cleaned_fight_odds.csv"
     ) -> None:
-        """Initialise the utility with an optional data directory and odds filename."""
+        """Initialize the utility with an optional data directory and odds filename."""
         module_dir = Path(__file__).resolve().parent
         repo_root = module_dir.parents[2]
 
@@ -193,9 +142,7 @@ class OddsUtils:
         self._data_dir = base_dir
         self._odds_filename = Path(odds_filename)
 
-    def _resolve_odds_path(
-        self, odds_filepath: Optional[Union[str, Path]] = None
-    ) -> Path:
+    def _resolve_odds_path(self, odds_filepath: Optional[Union[str, Path]] = None) -> Path:
         """Resolve the odds data path to an absolute location and validate it exists."""
         if odds_filepath is not None:
             candidate = Path(odds_filepath).expanduser()
@@ -220,21 +167,13 @@ class OddsUtils:
 
     @staticmethod
     def calculate_complementary_odd(odd: float) -> float:
-        """
-        Calculate complementary betting odd.
-
-        Args:
-            odd: Original betting odd
-
-        Returns:
-            Complementary betting odd
-        """
+        """Calculate complementary betting odd."""
         if odd > 0:
             prob = 100 / (odd + 100)
         else:
             prob = abs(odd) / (abs(odd) + 100)
 
-        complementary_prob = 1.045 - prob  # Make probabilities sum to 104.5%
+        complementary_prob = 1.045 - prob
 
         if complementary_prob >= 0.5:
             complementary_odd = -100 * complementary_prob / (1 - complementary_prob)
@@ -248,16 +187,7 @@ class OddsUtils:
         odds_a: Optional[float],
         odds_b: Optional[float]
     ) -> Tuple[List[float], float, float]:
-        """
-        Process a pair of betting odds.
-
-        Args:
-            odds_a: First fighter's odds (or None/NaN)
-            odds_b: Second fighter's odds (or None/NaN)
-
-        Returns:
-            Tuple of (odds list, odds difference, odds ratio)
-        """
+        """Process a pair of betting odds."""
         utils = DataUtils()
 
         if pd.notna(odds_a) and pd.notna(odds_b):
@@ -288,42 +218,26 @@ class OddsUtils:
         final_stats: pd.DataFrame,
         odds_filepath: Optional[Union[str, Path]] = None
     ) -> pd.DataFrame:
-        """
-        Process and merge betting odds data with fight statistics.
-
-        Args:
-            final_stats: DataFrame containing fight statistics
-            odds_filepath: Optional explicit path to the odds CSV file
-
-        Returns:
-            DataFrame with merged odds data
-        """
-        # Copy and remove duplicate columns
+        """Process and merge betting odds data with fight statistics."""
         final_stats = final_stats.copy().loc[:, ~final_stats.columns.duplicated()]
 
-        # Read odds data
         odds_path = self._resolve_odds_path(odds_filepath)
         try:
             odds_df = pd.read_csv(odds_path)
         except Exception as exc:
             raise RuntimeError(f"Failed to load odds data from {odds_path}") from exc
 
-        # Standardize fighter names
         final_stats['fighter'] = final_stats['fighter'].str.lower().str.strip()
         odds_df['Matchup'] = odds_df['Matchup'].str.lower().str.strip()
 
-        # Rename odds_df column so both DataFrames share the same key
         odds_df.rename(columns={'Matchup': 'fighter'}, inplace=True)
 
-        # Convert dates to datetime
         final_stats['fight_date'] = pd.to_datetime(final_stats['fight_date'])
         odds_df['Date'] = pd.to_datetime(odds_df['Date'], format='%Y-%m-%d')
 
-        # Sort both DataFrames by their respective date columns (required for merge_asof)
         final_stats.sort_values('fight_date', inplace=True)
         odds_df.sort_values('Date', inplace=True)
 
-        # Merge using merge_asof with a grouping key and tolerance of 1 day
         merged_df = pd.merge_asof(
             final_stats,
             odds_df,
@@ -334,10 +248,8 @@ class OddsUtils:
             direction='nearest'
         )
 
-        # Drop the extra Date column from the odds DataFrame
         merged_df.drop(columns=['Date'], inplace=True)
 
-        # Rename odds columns for clarity
         merged_df.rename(
             columns={
                 'Open': 'open_odds',
@@ -352,7 +264,7 @@ class OddsUtils:
 
 
 class FighterUtils:
-    """Utilities for processing fighter statistics."""
+    """Utilities for processing fighter statistics with advanced features."""
 
     def __init__(self, enable_verification: bool = True):
         """Initialize with DataUtils instance."""
@@ -363,33 +275,24 @@ class FighterUtils:
     def aggregate_fighter_stats(self, group: pd.DataFrame, numeric_columns: List[str]) -> pd.DataFrame:
         """
         Calculate cumulative career statistics for a fighter.
-
-        Args:
-            group: DataFrame group for a single fighter
-            numeric_columns: Numeric columns to aggregate
-
-        Returns:
-            DataFrame with added career statistics
+        FEATURE 1: Includes opponent quality tracking (will be populated after pairing).
         """
         group = group.sort_values('fight_date')
         cumulative_stats = group[numeric_columns].cumsum(skipna=True)
         fight_count = group.groupby('fighter').cumcount() + 1
 
-        # Calculate career and career average stats
         for col in numeric_columns:
             group[f"{col}_career"] = cumulative_stats[col]
             group[f"{col}_career_avg"] = self.utils.safe_divide(cumulative_stats[col], fight_count)
 
-        # ========== LEAKAGE CHECK #1: Career Statistics ==========
+        # Leakage check
         if self.enable_verification and len(group) > 0:
             fighter_name = group['fighter'].iloc[0]
             verification_passed = True
 
-            # Check first 3 fights
             for i in range(min(3, len(group))):
                 fight = group.iloc[i]
 
-                # Manual calculation check for knockdowns
                 if 'knockdowns' in numeric_columns and 'knockdowns_career' in group.columns:
                     expected_knockdowns = group['knockdowns'].iloc[:i+1].sum()
                     actual_knockdowns = fight.get('knockdowns_career', 0)
@@ -400,9 +303,8 @@ class FighterUtils:
                         print(f"   Expected knockdowns_career: {expected_knockdowns}, got {actual_knockdowns}")
                         break
 
-            if verification_passed and self.enable_verification:
+            if verification_passed:
                 self.verification_results.append(('career_stats', fighter_name, True))
-        # ========== END LEAKAGE CHECK #1 ==========
 
         # Calculate career rate stats
         group['significant_strikes_rate_career'] = self.utils.safe_divide(
@@ -424,96 +326,79 @@ class FighterUtils:
     def calculate_experience_and_days(self, group: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate fighter experience and days between fights.
-
-        Args:
-            group: DataFrame group for a single fighter
-
-        Returns:
-            DataFrame with added experience metrics
+        FEATURE 6: Includes layoff effects calculation.
         """
         group = group.sort_values('fight_date')
         group['years_of_experience'] = (group['fight_date'] - group['fight_date'].iloc[0]).dt.days / 365.25
         group['days_since_last_fight'] = (group['fight_date'] - group['fight_date'].shift()).dt.days
+
+        # FEATURE 6: Layoff Effects
+        optimal_days = 135
+        group['layoff_penalty'] = np.exp(
+            -((group['days_since_last_fight'].fillna(0) - optimal_days) ** 2) / (2 * 90 ** 2)
+        )
+
+        group['rushed_return'] = (group['days_since_last_fight'].fillna(999) < 60).astype(int)
+        group['ring_rust'] = (group['days_since_last_fight'].fillna(0) > 365).astype(int)
+
         return group
 
     def update_streaks(self, group: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate win and loss streaks for a fighter.
-
-        Args:
-            group: DataFrame group for a single fighter
-
-        Returns:
-            DataFrame with updated streak columns
+        FEATURE 2: Includes momentum indicators.
         """
         group = group.sort_values('fight_date')
-
-        # Create a copy of the group to avoid SettingWithCopyWarning
         group_copy = group.copy()
 
-        # Initialize streak columns
         group_copy['win_streak'] = 0
         group_copy['loss_streak'] = 0
 
-        # Calculate streaks for subsequent fights
         for i in range(1, len(group_copy)):
-            if group_copy.iloc[i-1]['winner'] == 1:  # Win
+            if group_copy.iloc[i-1]['winner'] == 1:
                 group_copy.iloc[i, group_copy.columns.get_loc('win_streak')] = group_copy.iloc[i-1]['win_streak'] + 1
                 group_copy.iloc[i, group_copy.columns.get_loc('loss_streak')] = 0
-            else:  # Loss
+            else:
                 group_copy.iloc[i, group_copy.columns.get_loc('win_streak')] = 0
                 group_copy.iloc[i, group_copy.columns.get_loc('loss_streak')] = group_copy.iloc[i-1]['loss_streak'] + 1
 
-        # ========== LEAKAGE CHECK #2: Win/Loss Streaks ==========
+        # FEATURE 2: Momentum Indicator
+        group_copy['momentum'] = group_copy['win_streak'] - group_copy['loss_streak']
+
+        # Leakage check
         if self.enable_verification and len(group_copy) > 0:
             fighter_name = group_copy['fighter'].iloc[0]
             first_fight = group_copy.iloc[0]
 
-            # First fight should have 0 streaks
             if first_fight['win_streak'] != 0 or first_fight['loss_streak'] != 0:
                 print(f"❌ LEAKAGE CHECK #2: Streaks for {fighter_name}")
-                print(f"   First fight has non-zero streaks: win={first_fight['win_streak']}, loss={first_fight['loss_streak']}")
                 self.verification_results.append(('streaks', fighter_name, False))
             else:
-                # Check streak continuity for first few fights
                 streak_valid = True
                 for i in range(1, min(3, len(group_copy))):
                     prev_fight = group_copy.iloc[i-1]
                     curr_fight = group_copy.iloc[i]
 
-                    if prev_fight['winner'] == 1:  # Previous was a win
+                    if prev_fight['winner'] == 1:
                         expected_win = prev_fight['win_streak'] + 1
                         if curr_fight['win_streak'] != expected_win or curr_fight['loss_streak'] != 0:
                             streak_valid = False
-                            print(f"❌ LEAKAGE CHECK #2: Streak continuity error for {fighter_name}, fight {i+1}")
                             break
-                    else:  # Previous was a loss
+                    else:
                         expected_loss = prev_fight['loss_streak'] + 1
                         if curr_fight['loss_streak'] != expected_loss or curr_fight['win_streak'] != 0:
                             streak_valid = False
-                            print(f"❌ LEAKAGE CHECK #2: Streak continuity error for {fighter_name}, fight {i+1}")
                             break
 
                 if streak_valid:
                     self.verification_results.append(('streaks', fighter_name, True))
-        # ========== END LEAKAGE CHECK #2 ==========
 
         return group_copy
 
     def calculate_time_based_stats(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate time-normalized statistics.
-
-        Args:
-            df: Fighter stats DataFrame
-
-        Returns:
-            DataFrame with added time-based statistics
-        """
-        # Convert career time (seconds) to minutes
+        """Calculate time-normalized statistics."""
         df['time_career_minutes'] = df['time_career'] / 60
 
-        # Calculate takedowns and knockdowns per 15 minutes
         df['takedowns_per_15min'] = self.utils.safe_divide(
             df['takedown_successful_career'], df['time_career_minutes']
         ) * 15
@@ -527,47 +412,42 @@ class FighterUtils:
     def calculate_total_fight_stats(self, group: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate cumulative fight statistics.
-
-        Args:
-            group: DataFrame group for a single fighter
-
-        Returns:
-            DataFrame with added fight outcome statistics
+        FEATURE 2: Includes recent form (EWMA).
+        FEATURE 1: Stores opponent quality data for later use.
         """
-        # Sort by date and reset index
         group = group.sort_values('fight_date').reset_index(drop=True)
 
-        # Calculate fight counts
         group['total_fights'] = range(1, len(group) + 1)
         group['total_wins'] = group['winner'].cumsum()
         group['total_losses'] = group['total_fights'] - group['total_wins']
 
-        # ========== LEAKAGE CHECK #3: Total Fight Stats ==========
+        # FEATURE 1: Opponent Quality Storage (populated after pairing)
+        if 'pre_fight_elo_b' in group.columns:
+            group['opponent_elo_at_fight'] = group['pre_fight_elo_b']
+            group['quality_adjusted_win'] = group['winner'] * (group['pre_fight_elo_b'] / 1500)
+            group['avg_opponent_elo'] = group['pre_fight_elo_b'].expanding().mean()
+
+        # Leakage check
         if self.enable_verification and len(group) > 0:
             fighter_name = group['fighter'].iloc[0]
             verification_passed = True
 
-            # Check first fight
             first_fight = group.iloc[0]
             if first_fight['total_fights'] != 1:
                 print(f"❌ LEAKAGE CHECK #3: Total fights for {fighter_name}")
-                print(f"   First fight has total_fights={first_fight['total_fights']} (should be 1)")
                 verification_passed = False
 
-            # Check progression
             for i in range(min(3, len(group))):
                 fight = group.iloc[i]
                 if fight['total_fights'] != i + 1:
                     print(f"❌ LEAKAGE CHECK #3: Total fights progression for {fighter_name}")
-                    print(f"   Fight {i+1} has total_fights={fight['total_fights']} (should be {i+1})")
                     verification_passed = False
                     break
 
             if verification_passed:
                 self.verification_results.append(('total_fights', fighter_name, True))
-        # ========== END LEAKAGE CHECK #3 ==========
 
-        # Create outcome type masks
+        # Calculate outcome types FIRST (before they're referenced)
         ko_mask = group['result'].isin([0, 3])
         submission_mask = group['result'] == 1
         decision_mask = group['result'].isin([2, 4])
@@ -575,17 +455,15 @@ class FighterUtils:
         win_mask = group['winner'] == 1
         loss_mask = ~win_mask
 
-        # Calculate win types using vectorized operations
         group['wins_by_ko'] = (ko_mask & win_mask).cumsum()
         group['wins_by_submission'] = (submission_mask & win_mask).cumsum()
         group['wins_by_decision'] = (decision_mask & win_mask).cumsum()
 
-        # Calculate loss types using vectorized operations
         group['losses_by_ko'] = (ko_mask & loss_mask).cumsum()
         group['losses_by_submission'] = (submission_mask & loss_mask).cumsum()
         group['losses_by_decision'] = (decision_mask & loss_mask).cumsum()
 
-        # Calculate win/loss rates
+        # NOW calculate rates (after the count columns exist)
         for outcome in ['ko', 'submission', 'decision']:
             group[f'win_rate_by_{outcome}'] = self.utils.safe_divide(
                 group[f'wins_by_{outcome}'], group['total_wins']
@@ -594,10 +472,73 @@ class FighterUtils:
                 group[f'losses_by_{outcome}'], group['total_losses']
             )
 
+        # FEATURE 2: Recent Form (Exponentially Weighted Moving Average)
+        # Now we can safely calculate these since the columns exist
+        group['ewm_win_rate'] = group['winner'].ewm(span=3, adjust=False, min_periods=1).mean()
+
+        ko_submission_mask = group['result'].isin([0, 1, 3])
+        group['ewm_finish_rate'] = ko_submission_mask.astype(float).ewm(span=3, adjust=False, min_periods=1).mean()
+
+        strike_acc = self.utils.safe_divide(
+            group['significant_strikes_landed'],
+            group['significant_strikes_attempted']
+        )
+        group['ewm_strike_accuracy'] = pd.Series(strike_acc).ewm(span=3, adjust=False, min_periods=1).mean()
+
+        # Performance Trajectory (now safe to calculate)
+        career_win_rate = group['total_wins'] / group['total_fights']
+        group['win_rate_trajectory'] = group['ewm_win_rate'] - career_win_rate
+
+        career_finish_rate = (
+                (group['wins_by_ko'] + group['wins_by_submission']) /
+                group['total_fights']
+        )
+        group['finish_rate_trajectory'] = group['ewm_finish_rate'] - career_finish_rate
+
+        return group
+
+    def calculate_fighting_style(self, group: pd.DataFrame) -> pd.DataFrame:
+        """
+        FEATURE 5: Calculate fighting style indicators.
+        Classifies fighters as strikers, grapplers, or pressure fighters.
+        """
+        group = group.sort_values('fight_date')
+
+        # Striker Score
+        striker_score = (
+            (group['significant_strikes_landed_per_min'] / 5.0).clip(0, 1) +
+            (group['distance_landed_career_avg'] / 30.0).clip(0, 1)
+        ) / 2
+        group['striker_score'] = striker_score.clip(0, 1)
+
+        # Grappler Score
+        grappler_score = (
+            (group['takedowns_per_15min'] / 3.0).clip(0, 1) +
+            (group['submission_attempt_career_avg'] / 2.0).clip(0, 1) +
+            (group['ground_landed_career_avg'] / 20.0).clip(0, 1)
+        ) / 3
+        group['grappler_score'] = grappler_score.clip(0, 1)
+
+        # Pressure Fighter Score
+        pressure_score = (
+            (group['total_strikes_attempted_per_min'] / 8.0).clip(0, 1) +
+            (group['clinch_landed_career_avg'] / 10.0).clip(0, 1)
+        ) / 2
+        group['pressure_score'] = pressure_score.clip(0, 1)
+
+        # Primary Style Classification
+        style_scores = pd.DataFrame({
+            'striker': striker_score,
+            'grappler': grappler_score,
+            'pressure': pressure_score
+        })
+        group['primary_style'] = style_scores.idxmax(axis=1)
+        group['style_confidence'] = style_scores.max(axis=1)
+
         return group
 
     def print_verification_summary(self):
-        """Print summary of verification results"""
+        """Print summary of verification results."""
         if self.verification_results:
             print("\n" + "="*60)
             print("LEAKAGE VERIFICATION SUMMARY")
@@ -621,15 +562,7 @@ class DateUtils:
 
     @staticmethod
     def parse_date(date_str: Any) -> pd.Timestamp:
-        """
-        Parse date string in various formats.
-
-        Args:
-            date_str: Date string to parse
-
-        Returns:
-            Parsed timestamp or NaT if parsing fails
-        """
+        """Parse date string in various formats."""
         if pd.isna(date_str):
             return pd.NaT
         try:
