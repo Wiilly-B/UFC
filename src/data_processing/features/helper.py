@@ -61,7 +61,7 @@ class DataUtils:
         ufc_stats.loc[ufc_stats['age'] < 0, 'age'] = np.nan
 
         ufc_stats = ufc_stats.drop(['round', 'location', 'name'], axis=1)
-        # ufc_stats = ufc_stats[~ufc_stats['weight_class'].str.contains("Women's")]
+        ufc_stats = ufc_stats[~ufc_stats['weight_class'].str.contains("Women's")]
 
         ufc_stats['time'] = (
                 pd.to_datetime(ufc_stats['time'], format='%M:%S').dt.minute * 60 +

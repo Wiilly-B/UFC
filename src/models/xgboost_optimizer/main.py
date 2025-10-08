@@ -1,7 +1,6 @@
 """UFC Fight Prediction - XGBoost training with walk-forward nested cross-validation and pause/resume."""
 
 from __future__ import annotations
-
 import json
 import warnings
 from datetime import datetime
@@ -11,42 +10,39 @@ import threading
 import time
 from optuna.pruners import MedianPruner
 from optuna.integration import XGBoostPruningCallback
-
-# ---- Plotting / feature preview toggles ----
-SHOW_PLOTS = True            # True -> show charts via plt.show(); False -> no charts
-SHOW_TRIAL_PLOTS = False     # False -> DO NOT spam per-trial plots (keep only final fold plot)
-FEATURE_PREVIEW_N = 30       # how many of the selected features to print (preview)
-# --------------------------------------------
-
-# ---- Feature selection toggle ----
-USE_TOP_K_FEATURES = True    # True -> select top K features on each outer train split; False -> use all features
-TOP_K_FEATURES = 300         # K in "top K"
-# ----------------------------------
-
 import matplotlib
-if not SHOW_PLOTS:
-    matplotlib.use("Agg")  # headless only when not showing
 import matplotlib.pyplot as plt
-
 import numpy as np
 import optuna
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import accuracy_score, roc_auc_score
 
+# ---- Plotting / feature preview toggles ----
+SHOW_PLOTS = True            # True -> show charts via plt.show(); False -> no charts
+SHOW_TRIAL_PLOTS = False     # False -> DO NOT spam per-trial plots (keep only final fold plot)
+FEATURE_PREVIEW_N = 10       # how many of the selected features to print (preview)
+if not SHOW_PLOTS:
+    matplotlib.use("Agg")  # headless only when not showing
+# --------------------------------------------
+
+# ---- Feature selection toggle ----
+USE_TOP_K_FEATURES = True    # True -> select top K features on each outer train split; False -> use all features
+TOP_K_FEATURES = 120      # K in "top K"
+INCLUDE_ODDS_COLUMNS = False  # when False, we drop odds/open/closing-related columns
+
+
 warnings.filterwarnings("ignore")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data" / "train_test"
 SAVE_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "trials"
-FINAL_MODEL_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "high_reg_no_odds_300"
+FINAL_MODEL_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "no_odds_high_reg_120f"
 TRIAL_PLOTS_DIR = SAVE_DIR / "trial_plots"
 
 ACC_THRESHOLD = 0.50
 VAL_ACC_SAVE_THRESHOLD = 0.50
-LOSS_GAP_THRESHOLD = 1
-
-INCLUDE_ODDS_COLUMNS = False  # when False, we drop odds/open/closing-related columns
+LOSS_GAP_THRESHOLD = 0.1
 
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -521,15 +517,15 @@ def walk_forward_nested_cv(X, y, dates, outer_cv: int = 5, inner_cv: int = 3,
                 "enable_categorical": True,
                 'n_estimators': trial.suggest_int('n_estimators', 100, 2000),
                 "eval_metric": ["logloss", "error"],
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 10),
-                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 6),
+                "min_child_weight": trial.suggest_int("min_child_weight", 5, 20),
                 "subsample": trial.suggest_float("subsample", 0.6, 1.0),
                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-                "gamma": trial.suggest_float("gamma", 0.01, 1.0, log=True),
-                "reg_alpha": trial.suggest_float("reg_alpha", 25, 30.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 25, 30.0, log=True),
-                "early_stopping_rounds": 50,
+                "gamma": trial.suggest_float("gamma", 0.5, 5.0, log=True),
+                "reg_alpha": trial.suggest_float("reg_alpha", 10, 100.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 10, 100.0, log=True),
+                "early_stopping_rounds": 10,
             }
 
             fold_aucs = []

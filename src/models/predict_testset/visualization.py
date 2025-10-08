@@ -5,7 +5,7 @@ Handles all calibration plots and visual analytics
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 from sklearn.calibration import calibration_curve
 
 

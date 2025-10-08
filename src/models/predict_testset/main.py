@@ -30,7 +30,6 @@ class Config:
     # Calibration settings
     use_calibration: bool = True
     calibration_type: str = 'isotonic'
-    range_calibration_ranges: List[float] = field(default_factory=lambda: [0.25, 0.45, 0.65, 0.85])
 
     # Betting strategy parameters
     initial_bankroll: float = 10000
@@ -370,6 +369,7 @@ if __name__ == "__main__":
         initial_bankroll=10000,
         kelly_fraction=0.5,
         fixed_bet_fraction=0.1,
-        model_dir='../../../saved_models/xgboost/low_reg_no_odds/',
+        model_dir='../../../saved_models/xgboost/no_odds_high_reg_120f/',
+        use_ensemble=True
     )
     main(custom_config)
