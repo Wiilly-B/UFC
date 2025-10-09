@@ -369,7 +369,7 @@ if __name__ == "__main__":
         initial_bankroll=10000,
         kelly_fraction=0.5,
         fixed_bet_fraction=0.1,
-        model_dir='../../../saved_models/xgboost/no_odds_high_reg_120f/',
+        model_dir='../../../saved_models/xgboost/test/',
         use_ensemble=True
     )
     main(custom_config)
