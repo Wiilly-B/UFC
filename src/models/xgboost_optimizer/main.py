@@ -1,17 +1,27 @@
-"""UFC Fight Prediction - XGBoost (walk-forward nested CV, leakage-safe)
+"""
+UFC Fight Prediction - XGBoost (single split, leakage-safe, autosave passing trials)
 
-Implements three key fixes:
-1) Walk-forward splitter covers the entire tail (no leftover samples).
-2) Preprocessing is *fit on outer-train only* and applied to outer-test (no leakage).
-   - numeric: median impute (from outer-train), float32-safe clipping
-   - categorical: categories learned on outer-train, aligned on outer-test
-3) Feature selection is *nested properly*:
-   - During inner CV, Top-K selection is re-run on each inner-train split.
-   - Before final outer refit/test, Top-K is re-run once on the full outer-train.
+What it does (chronological, no shuffle):
+- Train on TRAIN, validate on VAL, report on TEST (no shuffling, by date).
+- Preprocessing fit ONLY on TRAIN, applied to VAL/TEST (no leakage):
+  * numeric: median impute (from TRAIN), float32-safe clipping
+  * categorical: categories learned on TRAIN; unseen in VAL/TEST -> '<NA>'
+- Feature selection (Top-K by gain) fit ONLY on TRAIN; same cols applied to VAL/TEST.
+- Optuna objective is configurable:
+  * "logloss"  -> minimize VAL logloss
+  * "accuracy" -> maximize VAL accuracy (equivalently minimize VAL error)
+- For EACH trial:
+  * If (VAL logloss ≤ VAL_LOGLOSS_SAVE_MAX) and (gap := |train-VAL| ≤ GAP_MAX),
+    then we refit with fixed n_estimators (at the *chosen metric's* best iteration)
+    and AUTOSAVE the model immediately.
+  * For each autosaved model, we also save a PNG plot (in TRIAL_PLOTS_DIR) annotated with
+    best iteration & gap.
+- After tuning completes:
+  * Refit the final model (TRAIN+VAL by default) with best params & n_estimators
+    chosen by the configured objective.
+  * Evaluate on TEST and save a final model file with VAL+TEST metrics in filename.
 
-Other notes:
-- Optuna still minimizes validation logloss with pruning.
-- Best iteration chosen on a small holdout from the outer-train, then refit on full outer-train.
+No metadata sidecars — filenames contain the metrics.
 """
 
 from __future__ import annotations
@@ -39,44 +49,47 @@ from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
 
 # ==================== TOGGLES / PATHS ====================
 
-# ---- Plotting / feature preview toggles ----
-SHOW_PLOTS = True             # True -> show charts via plt.show(); False -> headless
-SHOW_TRIAL_PLOTS = False      # Per-trial mean curves (keep False to avoid spam)
-FEATURE_PREVIEW_N = 10        # how many of the selected features to print (preview)
+# ---- Plotting / preview ----
+SHOW_PLOTS = True
+SHOW_TRIAL_PLOTS = False
+FEATURE_PREVIEW_N = 12
 if not SHOW_PLOTS:
-    matplotlib.use("Agg")     # headless only when not showing
-# --------------------------------------------
+    matplotlib.use("Agg")
 
-# ---- Feature selection toggle ----
-USE_TOP_K_FEATURES = True     # True -> select top K features
-TOP_K_FEATURES = 120
-INCLUDE_ODDS_COLUMNS = False   # when False, drop odds/open/closing-related columns
+# ---- Feature selection ----
+USE_TOP_K_FEATURES = True
+TOP_K_FEATURES = 300
+
+# ---- Columns / odds ----
+INCLUDE_ODDS_COLUMNS = False  # False -> drop odds/open/close-related columns
+
+# ---- Refit / Autosave / Plots ----
+REFIT_ON_TRAIN_PLUS_VAL = True
+AUTOSAVE_INTERMEDIATE = True
+AUTOSAVE_INCLUDE_TEST = False  # keep False to avoid test peeking
+SAVE_PLOTS_AS_PNG = True
+
+# ---- Objective toggle (NEW) ----
+# Choose Optuna objective: "logloss" (minimize) or "accuracy" (maximize)
+OPTUNA_OBJECTIVE = "accuracy"  # or "accuracy"
+
+# ---- Save gates ----
+VAL_LOGLOSS_SAVE_MAX = 0.69  # ~random baseline for balanced classes
+GAP_MAX = 0.06  # |train_logloss - val_logloss| at chosen best iteration
 
 warnings.filterwarnings("ignore")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data" / "train_test"
-SAVE_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "trials"
-FINAL_MODEL_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "test"
+SAVE_DIR = PROJECT_ROOT / "saved_models" / "xgboost" / "single_split"
 TRIAL_PLOTS_DIR = SAVE_DIR / "trial_plots"
-
-# ---- Save criteria (logloss-based) ----
-VAL_LOGLOSS_SAVE_MAX = 0.69    # ~ random baseline for balanced labels
-TEST_LOGLOSS_SAVE_MAX = 0.70
-
-# Alignment cap used by constraints + outer save gate
-GAP_MAX = 0.04  # tighten (0.03) or relax (0.05–0.06) as needed
-
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-TRIAL_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+for p in (SAVE_DIR, TRIAL_PLOTS_DIR):
+    p.mkdir(parents=True, exist_ok=True)
 
 
 # ==================== PAUSE/RESUME CONTROL ====================
 
 class TrainingController:
-    """Controls pause/resume functionality for training with a non-blocking listener."""
-
     def __init__(self):
         self.paused = False
         self.should_stop = False
@@ -85,23 +98,17 @@ class TrainingController:
         self.running = False
 
     def start_listener(self):
-        """Start control listener in background thread (non-blocking)."""
         if self.listener_thread is not None and self.listener_thread.is_alive():
             return
-
         print("\n" + "=" * 70)
         print("  TRAINING CONTROLS ACTIVE")
-        print("  Type 'p' and press ENTER to PAUSE")
-        print("  Type 'r' and press ENTER to RESUME")
-        print("  Type 'q' and press ENTER to QUIT after current operation")
+        print("  Type 'p' + ENTER to PAUSE | 'r' to RESUME | 'q' to QUIT after current op")
         print("=" * 70 + "\n")
-
         self.running = True
         self.listener_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
         self.listener_thread.start()
 
     def _keyboard_listener(self):
-        """Non-blocking keyboard listener (Windows + POSIX)."""
         if os.name == "nt":
             try:
                 import msvcrt
@@ -109,17 +116,16 @@ class TrainingController:
                 while self.running:
                     time.sleep(0.2)
                 return
-
             buf = []
             while self.running:
                 try:
                     if msvcrt.kbhit():
                         ch = msvcrt.getwch()
                         if ch in ("\r", "\n"):
-                            command = "".join(buf).strip().lower()
+                            cmd = "".join(buf).strip().lower()
                             buf.clear()
-                            self._dispatch(command)
-                        elif ch == "\x03":  # Ctrl+C
+                            self._dispatch(cmd)
+                        elif ch == "\x03":
                             break
                         else:
                             buf.append(ch)
@@ -136,61 +142,41 @@ class TrainingController:
                     if rlist:
                         ch = sys.stdin.read(1)
                         if ch in ("\n", "\r"):
-                            command = "".join(line).strip().lower()
+                            cmd = "".join(line).strip().lower()
                             line.clear()
-                            self._dispatch(command)
+                            self._dispatch(cmd)
                         else:
                             line.append(ch)
                 except Exception:
                     break
 
-    def _dispatch(self, command: str):
-        if command == "p":
-            self._handle_pause()
-        elif command == "r":
-            self._handle_resume()
-        elif command == "q":
-            self._handle_quit()
-        elif command:
-            print(f"[Unknown: '{command}'] Valid commands: p, r, q")
-
-    def _handle_pause(self):
-        with self.pause_lock:
-            if not self.paused:
-                self.paused = True
-                print("\n" + "=" * 70)
-                print("  ⏸️  TRAINING PAUSED")
-                print("  Type 'r' and press ENTER to RESUME")
-                print("  Type 'q' and press ENTER to QUIT")
-                print("=" * 70 + "\n")
-
-    def _handle_resume(self):
-        with self.pause_lock:
-            if self.paused:
-                self.paused = False
-                print("\n" + "=" * 70)
-                print("  ▶️  TRAINING RESUMED")
-                print("=" * 70 + "\n")
-            else:
-                print("[Info] Training is not paused")
-
-    def _handle_quit(self):
-        with self.pause_lock:
-            if not self.should_stop:
-                self.should_stop = True
-                print("\n" + "=" * 70)
-                print("  🛑 QUIT REQUESTED - Will stop after current operation")
-                print("=" * 70 + "\n")
+    def _dispatch(self, cmd: str):
+        if cmd == "p":
+            with self.pause_lock:
+                if not self.paused:
+                    self.paused = True
+                    print("\n=== ⏸️  TRAINING PAUSED — 'r' to resume, 'q' to quit ===\n")
+        elif cmd == "r":
+            with self.pause_lock:
+                if self.paused:
+                    self.paused = False
+                    print("\n=== ▶️  TRAINING RESUMED ===\n")
+        elif cmd == "q":
+            with self.pause_lock:
+                if not self.should_stop:
+                    self.should_stop = True
+                    print("\n=== 🛑 QUIT REQUESTED — will stop after current operation ===\n")
+        elif cmd:
+            print(f"[Unknown '{cmd}'] Valid: p, r, q")
 
     def check_pause(self):
-        """Block while paused; raise if quit requested."""
         while True:
             with self.pause_lock:
                 if self.should_stop:
                     raise KeyboardInterrupt("Training stopped by user")
                 if not self.paused:
                     break
-            time.sleep(0.5)
+            time.sleep(0.3)
 
     def stop(self):
         self.running = False
@@ -201,109 +187,114 @@ class TrainingController:
 training_controller = TrainingController()
 
 
-# ==================== DATA LOADING (NO PREPROCESSING HERE) ====================
+# ==================== DATA LOADING ====================
 
-def load_data_for_cv(train_path: str | Path | None = None,
-                     val_path: str | Path | None = None,
-                     include_odds: bool = True,
-                     date_column: str = "current_fight_date"):
-    """Load and concatenate train/val. Sort by date. Do *not* impute/clip here (avoid leakage)."""
-    train_path = Path(train_path) if train_path is not None else DATA_DIR / "train_data.csv"
-    val_path = Path(val_path) if val_path is not None else DATA_DIR / "val_data.csv"
+def _drop_odds_columns(df: pd.DataFrame, include_odds: bool) -> pd.DataFrame:
+    if include_odds:
+        return df
+    terms = ("odd", "open", "opening", "close", "closing")
+    drop = [c for c in df.columns if any(t in c.lower() for t in terms)]
+    if drop:
+        print(f"[Cols] Dropping {len(drop)} odds-related columns.")
+    return df.drop(columns=drop, errors="ignore")
 
-    df_tr = pd.read_csv(train_path)
-    df_va = pd.read_csv(val_path)
-    df = pd.concat([df_tr, df_va], ignore_index=True)
 
-    if date_column not in df.columns:
-        raise ValueError(f"Date column '{date_column}' not found. Available: {df.columns.tolist()}")
+def load_datasets(
+        train_path: str | Path | None = None,
+        val_path: str | Path | None = None,
+        test_path: str | Path | None = None,
+        date_column: str = "current_fight_date",
+        include_odds: bool = True,
+):
+    train_path = Path(train_path) if train_path else DATA_DIR / "train_data.csv"
+    val_path = Path(val_path) if val_path else DATA_DIR / "val_data.csv"
+    test_path = Path(test_path) if test_path else DATA_DIR / "test_data.csv"
 
-    df[date_column] = pd.to_datetime(df[date_column], errors="coerce")
-    df = df.sort_values(date_column).reset_index(drop=True)
+    tr = pd.read_csv(train_path)
+    va = pd.read_csv(val_path)
+    te = pd.read_csv(test_path)
+
+    # Enforce chronological order
+    for df, name in [(tr, "TRAIN"), (va, "VAL"), (te, "TEST")]:
+        if date_column not in df.columns:
+            raise ValueError(f"{name}: Date column '{date_column}' not found.")
+        df[date_column] = pd.to_datetime(df[date_column], errors="coerce")
+        df.sort_values(date_column, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+    tr = _drop_odds_columns(tr, include_odds)
+    va = _drop_odds_columns(va, include_odds)
+    te = _drop_odds_columns(te, include_odds)
 
     drop_cols = ["winner", "fighter_a", "fighter_b", "date"]
-    if not include_odds:
-        odds_terms = ("odd", "open", "opening", "close", "closing")
-        odds_cols = [c for c in df.columns if any(t in c.lower() for t in odds_terms)]
-        drop_cols.extend(odds_cols)
-        print(f"Dropping {len(odds_cols)} odds-related columns: {odds_cols}")
+    feature_cols = [c for c in tr.columns if c not in drop_cols and c != date_column]
 
-    feature_cols = [c for c in df.columns if c not in drop_cols and c != date_column]
+    X_tr_raw, y_tr = tr[feature_cols].copy(), tr["winner"].copy()
+    X_va_raw, y_va = va[feature_cols].copy(), va["winner"].copy()
+    X_te_raw, y_te = te[feature_cols].copy(), te["winner"].copy()
 
-    X_raw = df[feature_cols].copy()   # raw (may contain NaNs, inf, objects)
-    y = df["winner"].copy()
-    dates = df[date_column].copy()
-
-    print(f"Loaded: X={X_raw.shape}, y={y.shape}, dates={dates.min()} → {dates.max()}")
-    return X_raw, y, dates
+    print(f"TRAIN: {tr[date_column].min().date()} → {tr[date_column].max().date()} | n={len(tr)}")
+    print(f"VAL  : {va[date_column].min().date()} → {va[date_column].max().date()} | n={len(va)}")
+    print(f"TEST : {te[date_column].min().date()} → {te[date_column].max().date()} | n={len(te)}")
+    print(f"Features: {len(feature_cols)}")
+    return X_tr_raw, y_tr, X_va_raw, y_va, X_te_raw, y_te, feature_cols
 
 
-# ==================== PER-FOLD PREPROCESSING (NO LEAKAGE) ====================
+# ==================== LEAKAGE-SAFE PREPROCESS ====================
 
-def fit_transform_fold(X_tr_raw: pd.DataFrame, X_te_raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Fit preprocessing on OUTER-TRAIN ONLY; apply to OUTER-TEST.
-    - numeric: median impute (fallback 0) + float32-safe clipping
-    - categorical: categories from train; unseen in test -> '<NA>'
-    """
+def fit_transform_preprocess(X_tr_raw: pd.DataFrame, X_va_raw: pd.DataFrame, X_te_raw: pd.DataFrame):
     X_tr = X_tr_raw.copy()
+    X_va = X_va_raw.copy()
     X_te = X_te_raw.copy()
 
-    # Numeric
+    # numeric
     num_cols = X_tr.select_dtypes(include=[np.number]).columns.tolist()
     if num_cols:
         med = X_tr[num_cols].median().fillna(0)
         X_tr[num_cols] = X_tr[num_cols].fillna(med)
+        X_va[num_cols] = X_va[num_cols].fillna(med)
         X_te[num_cols] = X_te[num_cols].fillna(med)
 
         max_val = np.finfo(np.float32).max / 10
         min_val = np.finfo(np.float32).min / 10
-        X_tr[num_cols] = X_tr[num_cols].clip(lower=min_val, upper=max_val)
-        X_te[num_cols] = X_te[num_cols].clip(lower=min_val, upper=max_val)
+        X_tr[num_cols] = X_tr[num_cols].clip(min_val, max_val)
+        X_va[num_cols] = X_va[num_cols].clip(min_val, max_val)
+        X_te[num_cols] = X_te[num_cols].clip(min_val, max_val)
 
-    # Categorical (object/string/category) → pandas Categorical with TRAIN categories
+    # categorical (train categories; unseen -> '<NA>')
     obj_cols = X_tr.select_dtypes(include=["object", "string", "category"]).columns.tolist()
     for col in obj_cols:
         tr_vals = X_tr[col].astype("string").fillna("<NA>")
         cats = pd.Index(sorted(pd.unique(pd.concat([tr_vals, pd.Series(["<NA>"])]))))
         X_tr[col] = pd.Categorical(tr_vals, categories=cats)
 
-        te_vals = X_te[col].astype("string").fillna("<NA>")
-        te_vals = te_vals.where(te_vals.isin(cats), "<NA>")
-        X_te[col] = pd.Categorical(te_vals, categories=cats)
+        def _align(s):
+            s2 = s.astype("string").fillna("<NA>")
+            s2 = s2.where(s2.isin(cats), "<NA>")
+            return pd.Categorical(s2, categories=cats)
 
-    # Safety assertions (no inf; NaNs should only appear if truly missing categories)
-    assert not np.isinf(X_tr.select_dtypes(include=[np.number]).to_numpy()).any(), "Inf in train after preprocess"
-    assert not np.isinf(X_te.select_dtypes(include=[np.number]).to_numpy()).any(), "Inf in test after preprocess"
-    # Allow NaNs for categoricals (XGB handles categorical missing); numeric should be clean
-    assert not X_tr.select_dtypes(include=[np.number]).isna().any().any(), "Numeric NaNs in train"
-    assert not X_te.select_dtypes(include=[np.number]).isna().any().any(), "Numeric NaNs in test"
+        X_va[col] = _align(X_va[col])
+        X_te[col] = _align(X_te[col])
 
-    return X_tr, X_te
+    # numeric safety
+    for df, nm in [(X_tr, "TRAIN"), (X_va, "VAL"), (X_te, "TEST")]:
+        assert not np.isinf(df.select_dtypes(include=[np.number]).to_numpy()).any(), f"Inf in {nm}"
+        assert not df.select_dtypes(include=[np.number]).isna().any().any(), f"Numeric NaN in {nm}"
+
+    return X_tr, X_va, X_te
 
 
-# ==================== FEATURE SELECTION (NESTED) ====================
+# ==================== FEATURE SELECTION ====================
 
-def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series,
-                               k: int = TOP_K_FEATURES,
-                               enabled: bool = USE_TOP_K_FEATURES) -> tuple[list[str], list[str]]:
-    """
-    If enabled:
-      - Train a quick XGB on the given TRAIN split only and select top-k by gain.
-    Else:
-      - Return all columns unchanged.
-
-    Returns (selected_cols, full_ranking_or_all_cols).
-    """
+def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series, k: int, enabled: bool):
     if not enabled:
         cols = list(X_tr.columns)
         print(f"[FS] DISABLED → using ALL {len(cols)} features.")
         if FEATURE_PREVIEW_N > 0:
-            preview = cols[:min(FEATURE_PREVIEW_N, len(cols))]
-            print("[FS] Preview:", ", ".join(preview))
-        return cols, cols
+            print("[FS] Preview:", ", ".join(cols[:min(FEATURE_PREVIEW_N, len(cols))]))
+        return cols
 
-    print(f"[FS] ENABLED → selecting top {k} features on this TRAIN split...")
+    print(f"[FS] ENABLED → selecting top {k} features on TRAIN only...")
     params = {
         "objective": "binary:logistic",
         "tree_method": "hist",
@@ -321,110 +312,33 @@ def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series,
     fs_model.fit(X_tr, y_tr, verbose=False)
 
     booster = fs_model.get_booster()
-    score = booster.get_score(importance_type="gain")  # dict: name -> gain
+    score = booster.get_score(importance_type="gain")
 
-    # Map f{i} -> names if needed
+    # map f{i} -> names if needed
     if score and all(k.startswith("f") for k in score.keys()):
         feat_names = booster.feature_names
-        mapped = {}
-        for key, val in score.items():
-            idx = int(key[1:])
-            if idx < len(feat_names):
-                mapped[feat_names[idx]] = val
-        score = mapped
+        score = {feat_names[int(k[1:])]: v for k, v in score.items() if int(k[1:]) < len(feat_names)}
 
     if not score:
-        print("[FS] Warning: no importance scores. Falling back to first K.")
-        full_rank = list(X_tr.columns)
-        selected_cols = full_rank[:k]
+        print("[FS] Warning: empty gain map; falling back to first K.")
+        selected = list(X_tr.columns)[:k]
     else:
-        full_rank = [name for name, _ in sorted(score.items(), key=lambda kv: kv[1], reverse=True)]
-        top_set = set(full_rank[:k])
-        selected_cols = [c for c in X_tr.columns if c in top_set]
+        ranked = [n for n, _ in sorted(score.items(), key=lambda kv: kv[1], reverse=True)]
+        keep = set(ranked[:k])
+        selected = [c for c in X_tr.columns if c in keep]
 
-    print(f"[FS] Selected {len(selected_cols)} features.")
+    print(f"[FS] Selected {len(selected)} features.")
     if FEATURE_PREVIEW_N > 0 and score:
-        preview = full_rank[:min(FEATURE_PREVIEW_N, len(full_rank))]
-        print("[FS] Top (by gain):", ", ".join(preview))
-    return selected_cols, full_rank
+        topn = [n for n, _ in sorted(score.items(), key=lambda kv: kv[1], reverse=True)][
+               :min(FEATURE_PREVIEW_N, len(score))]
+        print("[FS] Top by gain:", ", ".join(topn))
+    return selected
 
 
-# ==================== CV SPLITS & PLOTTING ====================
+# ==================== PLOTTING ====================
 
-def get_walk_forward_splits(n_samples: int, n_splits: int = 5, min_train_ratio: float = 0.5):
-    """
-    Expanding-window walk-forward splits that COVER THE TAIL.
-    - Training indices: [0, train_end)
-    - Test indices:     [train_end, next_edge)
-    Ensures the last fold ends exactly at n_samples.
-    """
-    min_train_size = int(n_samples * min_train_ratio)
-    if min_train_size < 1:
-        raise ValueError("min_train_ratio too small for the dataset size.")
-
-    # Evenly partition the remaining segment into n_splits contiguous chunks
-    edges = np.linspace(min_train_size, n_samples, n_splits + 1, dtype=int)
-    splits = []
-    for i in range(n_splits):
-        train_end = edges[i]
-        test_start = edges[i]
-        test_end = edges[i + 1]
-        if test_end > test_start:
-            train_idx = np.arange(0, train_end)
-            test_idx = np.arange(test_start, test_end)
-            splits.append((train_idx, test_idx))
-    return splits
-
-
-def plot_trial_metrics(train_logloss_curves, val_logloss_curves,
-                       train_error_curves, val_error_curves,
-                       trial_number: int, outer_fold: int) -> None:
-    if not SHOW_PLOTS or not SHOW_TRIAL_PLOTS:
-        return
-    if not train_logloss_curves or not val_logloss_curves:
-        return
-
-    max_len = max(len(c) for c in train_logloss_curves + val_logloss_curves)
-
-    def _mean_curve(curves, transform=None):
-        arr = np.full((len(curves), max_len), np.nan, dtype=float)
-        for idx, curve in enumerate(curves):
-            values = np.asarray(curve, dtype=float)
-            if transform is not None:
-                values = transform(values)
-            arr[idx, :len(values)] = values
-        return np.nanmean(arr, axis=0)
-
-    mean_train_loss = _mean_curve(train_logloss_curves)
-    mean_val_loss = _mean_curve(val_logloss_curves)
-    mean_train_acc = _mean_curve(train_error_curves, transform=lambda x: 1.0 - x)
-    mean_val_acc = _mean_curve(val_error_curves, transform=lambda x: 1.0 - x)
-
-    iterations = np.arange(1, max_len + 1)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(f"Optuna Trial {trial_number} - Outer Fold {outer_fold}")
-
-    axes[0].plot(iterations, mean_train_loss, linewidth=2, label="Train Logloss (mean)")
-    axes[0].plot(iterations, mean_val_loss, linewidth=2, label="Validation Logloss (mean)")
-    axes[0].set_xlabel("Boosting Rounds")
-    axes[0].set_ylabel("Log Loss")
-    axes[0].set_title("Loss Curves")
-    axes[0].legend()
-
-    axes[1].plot(iterations, mean_train_acc, linewidth=2, label="Train Accuracy (mean)")
-    axes[1].plot(iterations, mean_val_acc, linewidth=2, label="Validation Accuracy (mean)")
-    axes[1].set_xlabel("Boosting Rounds")
-    axes[1].set_ylabel("Accuracy")
-    axes[1].set_title("Accuracy Curves")
-    axes[1].legend()
-
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show(block=False)
-    plt.pause(0.001)
-
-
-def plot_final_fold_curves(evals_result: dict, outer_fold: int):
-    if not SHOW_PLOTS or not evals_result:
+def _annotated_trial_plot(evals_result: dict, title: str, best_idx: int, gap: float, save_path_png: Path | None):
+    if not evals_result:
         return
     tr_ll = evals_result.get("validation_0", {}).get("logloss", None)
     va_ll = evals_result.get("validation_1", {}).get("logloss", None)
@@ -433,488 +347,340 @@ def plot_final_fold_curves(evals_result: dict, outer_fold: int):
     if tr_ll is None or va_ll is None or tr_er is None or va_er is None:
         return
 
+    iters = np.arange(1, len(tr_ll) + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(f"Final Model Curves - Outer Fold {outer_fold}")
+    fig.suptitle(title)
 
-    axes[0].plot(np.arange(1, len(tr_ll) + 1), tr_ll, label="Train Logloss")
-    axes[0].plot(np.arange(1, len(va_ll) + 1), va_ll, label="Val Logloss")
+    # Loss
+    axes[0].plot(iters, tr_ll, linewidth=2, label="Train Logloss")
+    axes[0].plot(iters, va_ll, linewidth=2, label="Val Logloss")
+    axes[0].axvline(best_idx + 1, linestyle="--", linewidth=1)
+    axes[0].annotate(f"best@{best_idx + 1}\ngap={gap:.3f}",
+                     xy=(best_idx + 1, va_ll[best_idx]),
+                     xytext=(best_idx + 1, max(va_ll) * 0.9),
+                     arrowprops=dict(arrowstyle="->", lw=1), fontsize=9)
     axes[0].set_xlabel("Boosting Rounds")
     axes[0].set_ylabel("Log Loss")
     axes[0].legend()
     axes[0].set_title("Loss")
 
-    axes[1].plot(np.arange(1, len(tr_er) + 1), 1.0 - np.asarray(tr_er), label="Train Acc")
-    axes[1].plot(np.arange(1, len(va_er) + 1), 1.0 - np.asarray(va_er), label="Val Acc")
+    # Accuracy
+    axes[1].plot(iters, 1.0 - np.asarray(tr_er), linewidth=2, label="Train Accuracy")
+    axes[1].plot(iters, 1.0 - np.asarray(va_er), linewidth=2, label="Val Accuracy")
+    axes[1].axvline(best_idx + 1, linestyle="--", linewidth=1)
     axes[1].set_xlabel("Boosting Rounds")
     axes[1].set_ylabel("Accuracy")
     axes[1].legend()
     axes[1].set_title("Accuracy")
 
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show(block=False)
-    plt.pause(0.001)
+
+    if SAVE_PLOTS_AS_PNG and save_path_png is not None:
+        fig.savefig(save_path_png, dpi=120)
+
+    if SHOW_PLOTS:
+        plt.show(block=False)
+        plt.pause(0.001)
+    else:
+        plt.close(fig)
 
 
-def aggregate_best_params(best_params_per_fold):
-    aggregated = {}
-    param_names = set()
-    for params in best_params_per_fold:
-        param_names.update(params.keys())
-    for param_name in param_names:
-        values = [params[param_name] for params in best_params_per_fold]
-        if isinstance(values[0], (int, float)):
-            aggregated[param_name] = type(values[0])(np.median(values))
-        else:
-            from collections import Counter
-            aggregated[param_name] = Counter(values).most_common(1)[0][0]
-    return aggregated
+# ==================== SAVE HELPERS ====================
 
-
-# ==================== OPTUNA CONSTRAINTS (OPTIONAL) ====================
-
-def _constraints(trial: optuna.Trial):
+def _save_candidate_model(
+        trial_num: int,
+        best_n: int,
+        base_params: dict,
+        X_tr_sel: pd.DataFrame, y_tr: pd.Series,
+        X_va_sel: pd.DataFrame, y_va: pd.Series,
+        X_te_sel: pd.DataFrame | None = None, y_te: pd.Series | None = None,
+        run_tag: str = "ufc_xgb_single",
+        evals_result: dict | None = None,
+        best_idx: int | None = None,
+        gap_at_best: float | None = None,
+):
+    """Refit with fixed n_estimators (TRAIN+VAL if REFIT_ON_TRAIN_PLUS_VAL) and save immediately.
+       Also saves an annotated PNG plot if available.
     """
-    Constrained optimization hook (optional).
-    We keep mean GAP ≤ GAP_MAX via user_attrs if you later compute & store it.
-    For now we pass through; kept for compatibility.
+    fixed = {**base_params, "n_estimators": int(best_n), "early_stopping_rounds": None}
+    if REFIT_ON_TRAIN_PLUS_VAL:
+        X_refit = pd.concat([X_tr_sel, X_va_sel], axis=0)
+        y_refit = pd.concat([y_tr, y_va], axis=0)
+    else:
+        X_refit, y_refit = X_tr_sel, y_tr
+
+    model = xgb.XGBClassifier(**fixed)
+    model.fit(X_refit, y_refit, verbose=False)
+
+    # Compute VAL metrics for filename + gating
+    va_proba = model.predict_proba(X_va_sel)[:, 1]
+    va_pred = (va_proba >= 0.5).astype(int)
+    va_ll = log_loss(y_va, va_proba)
+    va_acc = accuracy_score(y_va, va_pred)
+
+    # Train logloss for gap
+    tr_proba = model.predict_proba(X_tr_sel)[:, 1]
+    tr_ll = log_loss(y_tr, tr_proba)
+    gap = abs(tr_ll - va_ll) if gap_at_best is None else gap_at_best
+
+    # Optional TEST peek (kept off by default)
+    test_part = ""
+    if AUTOSAVE_INCLUDE_TEST and X_te_sel is not None and y_te is not None:
+        te_proba = model.predict_proba(X_te_sel)[:, 1]
+        te_pred = (te_proba >= 0.5).astype(int)
+        te_ll = log_loss(y_te, te_proba)
+        te_acc = accuracy_score(y_te, te_pred)
+        test_part = f"_TESTacc{te_acc:.3f}_TESTll{te_ll:.3f}"
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"{run_tag}_TRIAL{trial_num:03d}_VALacc{va_acc:.3f}_GAP{gap:.3f}_VALll{va_ll:.3f}{test_part}_{ts}.json"
+    path = SAVE_DIR / fname
+    model.save_model(str(path))
+    print(f"  ↳ Autosaved: {path.name}")
+
+    # Save plot PNG with the same stem — in TRIAL_PLOTS_DIR (separate folder)
+    if evals_result is not None and best_idx is not None:
+        png_path = TRIAL_PLOTS_DIR / (path.stem + ".png")
+        _annotated_trial_plot(
+            evals_result,
+            title=f"Autosaved Trial {trial_num} (best@{best_n}, gap={gap:.3f})",
+            best_idx=best_idx,
+            gap=gap,
+            save_path_png=png_path,
+        )
+
+
+# ==================== TRAINER ====================
+
+def _choose_best_index(evals_result: dict) -> tuple[int, float, float, float]:
     """
-    mean_gap = trial.user_attrs.get("mean_loss_gap", 0.0)
-    return (max(0.0, mean_gap - GAP_MAX),)
+    Return (best_idx, va_ll_best, tr_ll_best, val_error_best) based on OPTUNA_OBJECTIVE.
+    - For "logloss": pick idx with minimal validation logloss.
+    - For "accuracy": pick idx with maximal validation accuracy == minimal validation error.
+    """
+    va_ll = np.asarray(evals_result["validation_1"]["logloss"], dtype=float)
+    tr_ll = np.asarray(evals_result["validation_0"]["logloss"], dtype=float)
+    va_er = np.asarray(evals_result["validation_1"]["error"], dtype=float)
+
+    if OPTUNA_OBJECTIVE.lower() == "accuracy":
+        # maximize accuracy == minimize error
+        best_idx = int(np.argmin(va_er))
+    else:
+        # default: minimize logloss
+        best_idx = int(np.argmin(va_ll))
+
+    return best_idx, float(va_ll[best_idx]), float(tr_ll[best_idx]), float(va_er[best_idx])
 
 
-# ==================== TRAINING LOOPS ====================
-
-def walk_forward_nested_cv(X_raw, y, dates, outer_cv: int = 5, inner_cv: int = 3,
-                           optuna_trials: int = 100, save_models: bool = True,
-                           run_number: int = 1, include_odds: bool = True):
-    """Run walk-forward nested CV with leakage-safe preprocessing and nested FS."""
-    print("\n" + "=" * 70)
-    print(f"RUN {run_number} | Walk-Forward Nested CV (logloss-min; nested FS; leakage-safe)")
-    print(f"Outer folds: {outer_cv} | Inner folds: {inner_cv} | Optuna trials: {optuna_trials}")
+def train_single_split(
+        optuna_trials: int = 80,
+        include_odds: bool = True,
+        run_tag: str = "ufc_xgb_single",
+        use_gpu: bool = True,
+) -> dict:
     print("=" * 70)
-
-    outer_splits = get_walk_forward_splits(len(X_raw), n_splits=outer_cv, min_train_ratio=0.5)
-
-    outer_test_logloss, outer_test_auc = [], []
-    outer_train_logloss, outer_train_auc = [], []
-    best_params_per_fold = []
-    best_n_per_fold = []
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    for fold_idx, (tr_idx, te_idx) in enumerate(outer_splits, start=1):
-        training_controller.check_pause()
-
-        print(f"\n{'=' * 70}")
-        print(f"  RUN {run_number} | OUTER FOLD {fold_idx}/{len(outer_splits)}")
-        print(f"{'=' * 70}")
-
-        X_tr_raw, X_te_raw = X_raw.iloc[tr_idx], X_raw.iloc[te_idx]
-        y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
-        dates_tr, dates_te = dates.iloc[tr_idx], dates.iloc[te_idx]
-
-        print(f"  Train: {dates_tr.min().date()} → {dates_tr.max().date()} ({len(X_tr_raw)})")
-        print(f"  Test : {dates_te.min().date()} → {dates_te.max().date()} ({len(X_te_raw)})")
-
-        # -------- FIX #2: leakage-safe preprocessing (fit on outer-train; apply to outer-test)
-        X_tr_proc, X_te_proc = fit_transform_fold(X_tr_raw, X_te_raw)
-
-        # -------- INNER CV (with nested FS *per inner split*)
-        inner_splits = get_walk_forward_splits(len(X_tr_proc), n_splits=inner_cv, min_train_ratio=0.6)
-        trial_count = [0]
-
-        def inner_objective(trial: optuna.Trial) -> float:
-            trial_count[0] += 1
-            if trial_count[0] % 5 == 0:
-                training_controller.check_pause()
-
-            # Conservative, stable hyperparameters; optimized for logloss
-            params = {
-                "objective": "binary:logistic",
-                "tree_method": "hist",
-                "device": "cuda",
-                "enable_categorical": True,
-                "n_estimators": trial.suggest_int("n_estimators", 100, 2000),
-                "eval_metric": ["logloss", "error"],
-                "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.03, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 4),
-                "min_child_weight": trial.suggest_int("min_child_weight", 20, 120, step=10),
-                "subsample": trial.suggest_float("subsample", 0.55, 0.85),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.55, 0.85),
-                "gamma": trial.suggest_float("gamma", 0.001, 10.0, log=True),
-                "reg_alpha": trial.suggest_float("reg_alpha", 50.0, 150.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 50.0, 150.0, log=True),
-                "max_delta_step": trial.suggest_int("max_delta_step", 3, 10),
-                "early_stopping_rounds": 50,
-                "sampling_method": "gradient_based",
-                "grow_policy": trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"]),
-            }
-
-            fold_val_logloss = []
-            train_logloss_curves, val_logloss_curves = [], []
-            train_error_curves, val_error_curves = [], []
-
-            for in_tr_idx, in_va_idx in inner_splits:
-                X_in_tr = X_tr_proc.iloc[in_tr_idx]
-                X_in_va = X_tr_proc.iloc[in_va_idx]
-                y_in_tr = y_tr.iloc[in_tr_idx]
-                y_in_va = y_tr.iloc[in_va_idx]
-
-                # -------- FIX #3: nested FS per inner TRAIN split
-                sel_cols, _ = select_top_features_by_xgb(
-                    X_in_tr, y_in_tr, k=TOP_K_FEATURES, enabled=USE_TOP_K_FEATURES
-                )
-                X_in_tr_sel = X_in_tr[sel_cols]
-                X_in_va_sel = X_in_va[sel_cols]
-
-                model = xgb.XGBClassifier(**params)
-                prune_cb = XGBoostPruningCallback(trial, "validation_1-logloss")
-                model.fit(
-                    X_in_tr_sel, y_in_tr,
-                    eval_set=[(X_in_tr_sel, y_in_tr), (X_in_va_sel, y_in_va)],
-                    verbose=False,
-                    callbacks=[prune_cb],
-                )
-
-                evals = model.evals_result()
-                tr_curve = np.asarray(evals["validation_0"]["logloss"], dtype=float)
-                va_curve = np.asarray(evals["validation_1"]["logloss"], dtype=float)
-
-                best_idx = int(np.argmin(va_curve))
-                fold_val_logloss.append(float(va_curve[best_idx]))
-
-                # collect for optional plotting
-                train_logloss_curves.append(tr_curve.tolist())
-                val_logloss_curves.append(va_curve.tolist())
-                train_error_curves.append(evals["validation_0"]["error"])
-                val_error_curves.append(evals["validation_1"]["error"])
-
-            plot_trial_metrics(
-                train_logloss_curves, val_logloss_curves,
-                train_error_curves, val_error_curves,
-                trial.number, fold_idx,
-            )
-
-            mean_val_ll = float(np.mean(fold_val_logloss))
-            # Store a nominal "gap" attribute if you compute one (kept for constraints API symmetry)
-            trial.set_user_attr("mean_loss_gap", 0.0)
-            return mean_val_ll
-
-        study = optuna.create_study(
-            direction="minimize",
-            sampler=optuna.samplers.TPESampler(
-                seed=random.randint(0, 100000),
-                constraints_func=_constraints,
-            ),
-            pruner=MedianPruner(n_warmup_steps=10),
-        )
-        study.optimize(inner_objective, n_trials=optuna_trials)
-
-        best_params = dict(study.best_params)
-        best_params_per_fold.append(best_params)
-        print(f"\n  Inner CV Best Val Logloss: {study.best_value:.4f}")
-
-        training_controller.check_pause()
-
-        # -------- Finalize feature set for the OUTER fold (FS on full outer-train)
-        sel_cols_outer, _ = select_top_features_by_xgb(
-            X_tr_proc, y_tr, k=TOP_K_FEATURES, enabled=USE_TOP_K_FEATURES
-        )
-        X_tr_sel = X_tr_proc[sel_cols_outer]
-        X_te_sel = X_te_proc[sel_cols_outer]
-
-        # Holdout from outer-train to lock best_iteration, then refit on full outer-train
-        val_split_point = int(len(X_tr_sel) * 0.85)
-        X_tr2, X_va2 = X_tr_sel.iloc[:val_split_point], X_tr_sel.iloc[val_split_point:]
-        y_tr2, y_va2 = y_tr.iloc[:val_split_point], y_tr.iloc[val_split_point:]
-
-        final_params = {
-            "objective": "binary:logistic",
-            "tree_method": "hist",
-            "device": "cuda",
-            "enable_categorical": True,
-            "eval_metric": ["logloss", "error"],
-            "early_stopping_rounds": 100,
-            **best_params,
-        }
-
-        # Stage 1: determine best_iteration using the small holdout
-        final_model = xgb.XGBClassifier(**final_params)
-        final_model.fit(
-            X_tr2, y_tr2,
-            eval_set=[(X_tr2, y_tr2), (X_va2, y_va2)],
-            verbose=False,
-        )
-
-        evals_result = final_model.evals_result()
-        plot_final_fold_curves(evals_result, fold_idx)
-
-        val_loss_curve = evals_result["validation_1"]["logloss"]
-        best_iteration = getattr(final_model, "best_iteration", None)
-        metric_index = int(best_iteration) if best_iteration is not None else int(np.argmin(val_loss_curve))
-        best_n_estimators = metric_index + 1
-        best_n_per_fold.append(int(best_n_estimators))
-
-        # Stage 2: refit on ALL outer-train with fixed n_estimators
-        final_params_refit = {
-            **final_params,
-            "n_estimators": int(best_n_estimators),
-            "early_stopping_rounds": None,
-        }
-        refit_model = xgb.XGBClassifier(**final_params_refit)
-        refit_model.fit(X_tr_sel, y_tr, verbose=False)
-
-        # Evaluate on outer-test
-        te_proba = refit_model.predict_proba(X_te_sel)[:, 1]
-        te_logloss = log_loss(y_te, te_proba)
-        te_auc = roc_auc_score(y_te, te_proba)
-
-        # Also record outer-train metrics (for diagnostics)
-        tr_proba = refit_model.predict_proba(X_tr_sel)[:, 1]
-        tr_logloss = log_loss(y_tr, tr_proba)
-        tr_auc = roc_auc_score(y_tr, tr_proba)
-
-        outer_test_logloss.append(te_logloss)
-        outer_test_auc.append(te_auc)
-        outer_train_logloss.append(tr_logloss)
-        outer_train_auc.append(tr_auc)
-
-        print(f"\n  FOLD {fold_idx} | Test LOGLOSS: {te_logloss:.4f} | Test AUC: {te_auc:.4f}")
-
-        # Optional conservative saving gate
-        if save_models and (te_logloss <= TEST_LOGLOSS_SAVE_MAX):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_path = SAVE_DIR / f"run{run_number}_fold{fold_idx}_tll{te_logloss:.3f}_{timestamp}.json"
-            refit_model.save_model(str(model_path))
-
-            metadata_path = SAVE_DIR / f"run{run_number}_fold{fold_idx}_metadata_{timestamp}.json"
-            metadata = {
-                "run_number": run_number,
-                "fold": fold_idx,
-                "validation_method": "walk_forward",
-                "include_odds": include_odds,
-                "best_n_estimators": int(best_n_estimators),
-                "metrics": {
-                    "test_logloss": float(te_logloss),
-                    "test_auc": float(te_auc),
-                    "train_logloss": float(tr_logloss),
-                    "train_auc": float(tr_auc),
-                },
-                "selected_feature_count": len(sel_cols_outer),
-            }
-            metadata_path.write_text(json.dumps(metadata, indent=2))
-
-    print("\n" + "=" * 70)
-    print(f"  RUN {run_number} | RESULTS (lower logloss is better)")
-    print(f"  Test Logloss: {np.mean(outer_test_logloss):.4f} ± {np.std(outer_test_logloss):.4f}")
-    print(f"  Test AUC:     {np.mean(outer_test_auc):.4f} ± {np.std(outer_test_auc):.4f}")
+    print("  SINGLE-SPLIT TRAINER (leakage-safe, autosave passing trials)")
+    print(f"  Optuna objective: {OPTUNA_OBJECTIVE.upper()}")
     print("=" * 70)
-
-    return {
-        "outer_test_logloss": outer_test_logloss,
-        "outer_test_auc": outer_test_auc,
-        "outer_train_logloss": outer_train_logloss,
-        "outer_train_auc": outer_train_auc,
-        "best_params_per_fold": best_params_per_fold,
-        "best_n_per_fold": best_n_per_fold,
-    }
-
-
-def train_final_model_on_all_data(X_raw, y, dates, aggregated_params, median_n_estimators,
-                                  run_number, include_odds):
-    """Train final production model (fit on ALL data, with FS and no leakage in prep)."""
-    training_controller.check_pause()
-
-    print("\n" + "=" * 70)
-    print(f"  RUN {run_number} | TRAINING FINAL MODEL (fit on ALL data)")
-    print("=" * 70)
-
-    # For the final model, do a single leakage-safe preprocessing step by treating
-    # ALL data as "train" (since this is the production fit after CV is complete).
-    # Here we just impute/clip globally and set categories globally.
-    X_all = X_raw.copy()
-
-    # Numeric
-    num_cols = X_all.select_dtypes(include=[np.number]).columns.tolist()
-    if num_cols:
-        med = X_all[num_cols].median().fillna(0)
-        X_all[num_cols] = X_all[num_cols].fillna(med)
-        max_val = np.finfo(np.float32).max / 10
-        min_val = np.finfo(np.float32).min / 10
-        X_all[num_cols] = X_all[num_cols].clip(lower=min_val, upper=max_val)
-
-    # Categorical
-    obj_cols = X_all.select_dtypes(include=["object", "string", "category"]).columns.tolist()
-    for col in obj_cols:
-        vals = X_all[col].astype("string").fillna("<NA>")
-        cats = pd.Index(sorted(pd.unique(pd.concat([vals, pd.Series(["<NA>"])]))))
-        X_all[col] = pd.Categorical(vals, categories=cats)
-
-    # Final feature selection on ALL data (for the production model)
-    sel_cols_all, _ = select_top_features_by_xgb(
-        X_all, y, k=TOP_K_FEATURES, enabled=USE_TOP_K_FEATURES
-    )
-    X_all_sel = X_all[sel_cols_all]
-
-    final_params = {
-        "objective": "binary:logistic",
-        "tree_method": "hist",
-        "device": "cuda",
-        "predictor": "gpu_predictor",
-        "enable_categorical": True,
-        "n_estimators": int(median_n_estimators),
-        "eval_metric": ["logloss", "error"],
-        "early_stopping_rounds": None,
-        **aggregated_params,
-    }
-
-    final_model = xgb.XGBClassifier(**final_params)
-    final_model.fit(X_all_sel, y, verbose=False)
-
-    train_proba = final_model.predict_proba(X_all_sel)[:, 1]
-    train_logloss = log_loss(y, train_proba)
-    train_auc = roc_auc_score(y, train_proba)
-
-    print(f"  Train LOGLOSS: {train_logloss:.4f} | Train AUC: {train_auc:.4f}")
-    print("=" * 70)
-
-    return final_model, final_params, train_logloss, train_auc, sel_cols_all
-
-
-def train_xgboost_walkforward(optuna_trials: int = 100, outer_cv: int = 5,
-                              inner_cv: int = 3, save_models: bool = True,
-                              run_number: int = 1, include_odds: bool = True) -> dict:
-    """Entry point for walk-forward training with the three fixes applied."""
-    print("=" * 70)
-    print(f"  RUN {run_number} | XGBoost Walk-Forward Training (nested FS; leakage-safe)")
-    print("=" * 70)
-
-    X_raw, y, dates = load_data_for_cv(include_odds=include_odds)
-
-    results = walk_forward_nested_cv(
-        X_raw, y, dates,
-        outer_cv=outer_cv,
-        inner_cv=inner_cv,
-        optuna_trials=optuna_trials,
-        save_models=save_models,
-        run_number=run_number,
-        include_odds=include_odds,
-    )
-
-    aggregated_params = aggregate_best_params(results["best_params_per_fold"])
-    median_n_estimators = int(np.median(results["best_n_per_fold"]))
-
-    final_model, final_params, train_logloss, train_auc, sel_cols_all = train_final_model_on_all_data(
-        X_raw, y, dates, aggregated_params, median_n_estimators, run_number, include_odds
-    )
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    final_model_path = FINAL_MODEL_DIR / f"run{run_number}_final_model_{timestamp}.json"
-    final_model.save_model(str(final_model_path))
-    print(f"  ✓ Model saved: {final_model_path.name}")
-
-    meta_path = FINAL_MODEL_DIR / f"run{run_number}_final_metadata_{timestamp}.json"
-    meta = {
-        "run_number": run_number,
-        "model_path": str(final_model_path),
-        "selected_feature_count": len(sel_cols_all),
-        "selected_features_sample": sel_cols_all[:min(20, len(sel_cols_all))],
-        "train_logloss": float(train_logloss),
-        "train_auc": float(train_auc),
-        "cv_summary": {
-            "mean_test_logloss": float(np.mean(results["outer_test_logloss"])),
-            "std_test_logloss": float(np.std(results["outer_test_logloss"])),
-            "mean_test_auc": float(np.mean(results["outer_test_auc"])),
-            "std_test_auc": float(np.std(results["outer_test_auc"])),
-        },
-    }
-    meta_path.write_text(json.dumps(meta, indent=2))
-
-    return {
-        "run_number": run_number,
-        "model_path": str(final_model_path),
-        "mean_test_logloss": float(np.mean(results["outer_test_logloss"])),
-        "std_test_logloss": float(np.std(results["outer_test_logloss"])),
-        "mean_test_auc": float(np.mean(results["outer_test_auc"])),
-        "std_test_auc": float(np.std(results["outer_test_auc"])),
-    }
-
-
-def run_multiple_training_sessions(n_runs: int = 5, optuna_trials: int = 100,
-                                   outer_cv: int = 5, inner_cv: int = 3,
-                                   save_models: bool = True, include_odds: bool = True):
-    """Run multiple training sessions with pause/resume."""
-    print("\n" + "█" * 70)
-    print(f"█  WALK-FORWARD TRAINING - {n_runs} RUNS (nested FS; leakage-safe)")
-    print("█" * 70 + "\n")
 
     training_controller.start_listener()
-    all_run_results = []
 
-    try:
-        for run_idx in range(1, n_runs + 1):
+    X_tr_raw, y_tr, X_va_raw, y_va, X_te_raw, y_te, _ = load_datasets(include_odds=include_odds)
+    X_tr, X_va, X_te = fit_transform_preprocess(X_tr_raw, X_va_raw, X_te_raw)
+
+    # Feature selection on TRAIN only
+    sel_cols = select_top_features_by_xgb(X_tr, y_tr, TOP_K_FEATURES, USE_TOP_K_FEATURES)
+    X_tr_sel, X_va_sel, X_te_sel = X_tr[sel_cols], X_va[sel_cols], X_te[sel_cols]
+
+    # Optuna search
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    trial_counter = [0]
+
+    # Configure pruning metric & study direction based on objective
+    if OPTUNA_OBJECTIVE.lower() == "accuracy":
+        prune_metric = "validation_1-error"  # lower = better
+        study_direction = "minimize"  # we minimize error
+    else:
+        prune_metric = "validation_1-logloss"
+        study_direction = "minimize"
+
+    def objective(trial: optuna.Trial) -> float:
+        trial_counter[0] += 1
+        if trial_counter[0] % 5 == 0:
             training_controller.check_pause()
-            print(f"\n{'█' * 70}")
-            print(f"█  RUN {run_idx}/{n_runs}")
-            print(f"{'█' * 70}\n")
 
-            run_results = train_xgboost_walkforward(
-                optuna_trials=optuna_trials,
-                outer_cv=outer_cv,
-                inner_cv=inner_cv,
-                save_models=save_models,
-                run_number=run_idx,
-                include_odds=include_odds,
+        params = {
+            "objective": "binary:logistic",
+            "tree_method": "hist",
+            "device": "cuda" if use_gpu else "cpu",
+            "enable_categorical": True,
+            "n_estimators": trial.suggest_int("n_estimators", 100, 3000),
+            "eval_metric": ["logloss", "error"],
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.08, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 64.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "gamma": trial.suggest_float("gamma", 1e-3, 10.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-2, 200.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-2, 200.0, log=True),
+            "max_delta_step": trial.suggest_int("max_delta_step", 0, 3),
+            "grow_policy": trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"]),
+            "max_leaves": trial.suggest_int("max_leaves", 16, 256) if trial.params.get(
+                "grow_policy") == "lossguide" else 0,
+            "max_bin": trial.suggest_int("max_bin", 64, 512),
+            "sampling_method": "gradient_based",
+            "early_stopping_rounds": 50,
+        }
+
+        model = xgb.XGBClassifier(**params)
+        model.fit(
+            X_tr_sel, y_tr,
+            eval_set=[(X_tr_sel, y_tr), (X_va_sel, y_va)],
+            verbose=False,
+            callbacks=[XGBoostPruningCallback(trial, prune_metric)],
+        )
+
+        ev = model.evals_result()
+        if SHOW_TRIAL_PLOTS:
+            _annotated_trial_plot(
+                ev,
+                title=f"Trial {trial.number}",
+                best_idx=_choose_best_index(ev)[0],
+                gap=0.0,
+                save_path_png=None
             )
-            all_run_results.append(run_results)
 
-    except KeyboardInterrupt:
-        print("\n" + "=" * 70)
-        print("  TRAINING STOPPED BY USER")
-        print(f"  Completed {len(all_run_results)}/{n_runs} runs")
-        print("=" * 70)
-    finally:
-        training_controller.stop()
+        # Choose best by configured objective
+        best_idx, va_ll_at_best, tr_ll_at_best, va_err_at_best = _choose_best_index(ev)
+        gap_at_best = abs(tr_ll_at_best - va_ll_at_best)
+        trial.set_user_attr("loss_gap_at_best", float(gap_at_best))
 
-    if not all_run_results:
-        print("\nNo runs completed.")
-        return
+        # ✅ AUTOSAVE ANY PASSING TRIAL (mid-run) — gating still by logloss + gap
+        if AUTOSAVE_INTERMEDIATE and (va_ll_at_best <= VAL_LOGLOSS_SAVE_MAX) and (gap_at_best <= GAP_MAX):
+            best_n = best_idx + 1
+            _save_candidate_model(
+                trial_num=trial.number,
+                best_n=best_n,
+                base_params={
+                    "objective": "binary:logistic",
+                    "tree_method": "hist",
+                    "device": "cuda" if use_gpu else "cpu",
+                    "enable_categorical": True,
+                    "eval_metric": ["logloss", "error"],
+                    **{k: v for k, v in trial.params.items()},
+                },
+                X_tr_sel=X_tr_sel, y_tr=y_tr,
+                X_va_sel=X_va_sel, y_va=y_va,
+                X_te_sel=X_te_sel if AUTOSAVE_INCLUDE_TEST else None,
+                y_te=y_te if AUTOSAVE_INCLUDE_TEST else None,
+                run_tag=run_tag,
+                evals_result=ev,
+                best_idx=best_idx,
+                gap_at_best=gap_at_best,
+            )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary_path = FINAL_MODEL_DIR / f"all_runs_summary_{timestamp}.json"
+        # Return objective value to minimize
+        if OPTUNA_OBJECTIVE.lower() == "accuracy":
+            return float(va_err_at_best)  # minimize error == maximize accuracy
+        else:
+            return float(va_ll_at_best)  # minimize logloss
 
-    summary = {
-        "total_runs": n_runs,
-        "completed_runs": len(all_run_results),
-        "timestamp": timestamp,
-        "all_runs": all_run_results,
-        "aggregate_statistics": {
-            "mean_test_logloss": float(np.mean([r["mean_test_logloss"] for r in all_run_results])),
-            "std_test_logloss": float(np.std([r["mean_test_logloss"] for r in all_run_results])),
-            "mean_test_auc": float(np.mean([r["mean_test_auc"] for r in all_run_results])),
-            "std_test_auc": float(np.std([r["mean_test_auc"] for r in all_run_results])),
-        },
+    study = optuna.create_study(direction=study_direction,
+                                sampler=optuna.samplers.TPESampler(),
+                                pruner=MedianPruner(n_warmup_steps=10))
+    study.optimize(objective, n_trials=optuna_trials)
+
+    best_params = study.best_params
+    print(f"\nBest VAL objective ({OPTUNA_OBJECTIVE}): {study.best_value:.4f}")
+    print("Best params:", json.dumps(best_params, indent=2))
+
+    # === Final stage: lock best_iteration on TRAIN vs VAL using configured objective
+    final_stage_params = {
+        "objective": "binary:logistic",
+        "tree_method": "hist",
+        "device": "cuda" if use_gpu else "cpu",
+        "enable_categorical": True,
+        "eval_metric": ["logloss", "error"],
+        "early_stopping_rounds": 100,
+        **best_params,
     }
-    summary_path.write_text(json.dumps(summary, indent=2))
 
-    print("\n" + "█" * 70)
-    print("█  TRAINING COMPLETE")
-    print(f"█  Completed: {len(all_run_results)}/{n_runs} runs")
-    print(f"█  Mean Test Logloss: {summary['aggregate_statistics']['mean_test_logloss']:.4f}")
-    print(f"█  Mean Test AUC:     {summary['aggregate_statistics']['mean_test_auc']:.4f}")
-    print("█" * 70 + "\n")
+    stage_model = xgb.XGBClassifier(**final_stage_params)
+    stage_model.fit(
+        X_tr_sel, y_tr,
+        eval_set=[(X_tr_sel, y_tr), (X_va_sel, y_va)],
+        verbose=False,
+    )
+    ev = stage_model.evals_result()
 
+    best_idx, va_ll_at_best, tr_ll_at_best, _va_err_at_best = _choose_best_index(ev)
+    best_n = best_idx + 1
+    loss_gap = abs(tr_ll_at_best - va_ll_at_best)
+
+    # Optionally show/save annotated plot for the final stage
+    final_png = TRIAL_PLOTS_DIR / f"{run_tag}_FINAL_stage.png" if SAVE_PLOTS_AS_PNG else None
+    _annotated_trial_plot(ev, title=f"Final Stage (best@{best_n}, gap={loss_gap:.3f})",
+                          best_idx=best_idx, gap=loss_gap, save_path_png=final_png)
+
+    # Refit production model with fixed n_estimators (TRAIN+VAL default)
+    fixed_params = {**final_stage_params, "n_estimators": int(best_n), "early_stopping_rounds": None}
+    if REFIT_ON_TRAIN_PLUS_VAL:
+        X_refit = pd.concat([X_tr_sel, X_va_sel], axis=0)
+        y_refit = pd.concat([y_tr, y_va], axis=0)
+    else:
+        X_refit, y_refit = X_tr_sel, y_tr
+
+    refit_model = xgb.XGBClassifier(**fixed_params)
+    refit_model.fit(X_refit, y_refit, verbose=False)
+
+    # Evaluate on VAL (for filename) and TEST (final reporting)
+    va_proba = refit_model.predict_proba(X_va_sel)[:, 1]
+    va_pred = (va_proba >= 0.5).astype(int)
+    va_logloss = log_loss(y_va, va_proba)
+    va_acc = accuracy_score(y_va, va_pred)
+
+    te_proba = refit_model.predict_proba(X_te_sel)[:, 1]
+    te_pred = (te_proba >= 0.5).astype(int)
+    te_logloss = log_loss(y_te, te_proba)
+    te_acc = accuracy_score(y_te, te_pred)
+    te_auc = roc_auc_score(y_te, te_proba)
+
+    print(f"\nVAL  -> Logloss {va_logloss:.4f} | Acc {va_acc:.3f} | Gap |train-VAL| {loss_gap:.4f}")
+    print(f"TEST -> Logloss {te_logloss:.4f} | Acc {te_acc:.3f} | AUC {te_auc:.4f}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_name = f"{run_tag}_FINAL_VALacc{va_acc:.3f}_GAP{loss_gap:.3f}_VALll{va_logloss:.3f}_TESTacc{te_acc:.3f}_TESTll{te_logloss:.3f}_{ts}.json"
+    final_path = SAVE_DIR / final_name
+    refit_model.save_model(str(final_path))
+    print(f"✓ Saved FINAL model: {final_path.name}")
+
+    return {
+        "best_n_estimators": int(best_n),
+        "val_logloss": float(va_logloss),
+        "val_accuracy": float(va_acc),
+        "loss_gap": float(loss_gap),
+        "test_logloss": float(te_logloss),
+        "test_accuracy": float(te_acc),
+        "test_auc": float(te_auc),
+        "selected_features": sel_cols,
+        "refit_on_train_plus_val": REFIT_ON_TRAIN_PLUS_VAL,
+        "optuna_objective": OPTUNA_OBJECTIVE,
+    }
+
+
+# ==================== MAIN ====================
 
 if __name__ == "__main__":
     try:
-        run_multiple_training_sessions(
-            n_runs=25,
-            optuna_trials=20,
-            outer_cv=5,
-            inner_cv=3,
-            save_models=True,
-            include_odds=INCLUDE_ODDS_COLUMNS
+        training_controller.start_listener()
+        res = train_single_split(
+            optuna_trials=250,  # tune as needed
+            include_odds=INCLUDE_ODDS_COLUMNS,
+            run_tag="ufc_xgb_single",
+            use_gpu=True,
         )
+        print("\nRESULTS:", json.dumps(res, indent=2))
     except KeyboardInterrupt:
         print("\nTraining interrupted. Exiting...")
     finally:
