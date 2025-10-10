@@ -395,7 +395,7 @@ if __name__ == "__main__":
     # Example custom configuration
     custom_config = Config(
         manual_threshold=0.50,
-        use_calibration=False,
+        use_calibration=True,
         calibration_type='isotonic',            # or 'sigmoid'
         calibration_backend='cv',               # 'cv' for CalibratedClassifierCV, 'simple' for direct mapping
         initial_bankroll=10000,
@@ -403,7 +403,7 @@ if __name__ == "__main__":
         fixed_bet_fraction=0.1,
         model_dir='../../../saved_models/xgboost/single_split/',  # autosaved TRIAL/FINAL models
         model_filename_pattern=r'ufc_xgb_single_(?:TRIAL\d{3}|FINAL).*\.json$',
-        use_ensemble=True,
+        use_ensemble=False,
         require_trained_encoder=True           # set True if you have the training-time encoder saved
     )
     main(custom_config)

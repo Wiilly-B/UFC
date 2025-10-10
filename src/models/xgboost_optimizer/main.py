@@ -3,27 +3,17 @@ UFC Fight Prediction - XGBoost (single split, leakage-safe, autosave passing tri
 (Refactored: keyboard listener & plotting moved to helper.py)
 """
 from __future__ import annotations
-
 import json
 import warnings
 from datetime import datetime
 from pathlib import Path
-import random
-import time
-import os
-import sys
-
 from optuna.pruners import MedianPruner
 from optuna.integration import XGBoostPruningCallback
-
-import matplotlib  # backend switch handled below
 import numpy as np
 import optuna
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
-
-# --- New imports from helper ---
 from helper import TrainingController, annotated_trial_plot, set_matplotlib_backend
 
 # ==================== TOGGLES / PATHS ====================
@@ -49,11 +39,11 @@ SAVE_PLOTS_AS_PNG = True
 
 # ---- Objective toggle (NEW) ----
 # Choose Optuna objective: "logloss" (minimize) or "accuracy" (maximize)
-OPTUNA_OBJECTIVE = "accuracy"
+OPTUNA_OBJECTIVE = "logloss"
 
 # ---- Save gates ----
-VAL_LOGLOSS_SAVE_MAX = 0.69   # ~random baseline for balanced classes
-GAP_MAX = 0.06                # |train_logloss - val_logloss| at chosen best iteration
+VAL_LOGLOSS_SAVE_MAX = 0.69  # ~random baseline for balanced classes
+GAP_MAX = 0.06  # |train_logloss - val_logloss| at chosen best iteration
 
 warnings.filterwarnings("ignore")
 
@@ -68,6 +58,7 @@ for p in (SAVE_DIR, TRIAL_PLOTS_DIR):
 
 training_controller = TrainingController()
 
+
 # ==================== DATA LOADING ====================
 
 def _drop_odds_columns(df: pd.DataFrame, include_odds: bool) -> pd.DataFrame:
@@ -79,12 +70,13 @@ def _drop_odds_columns(df: pd.DataFrame, include_odds: bool) -> pd.DataFrame:
         print(f"[Cols] Dropping {len(drop)} odds-related columns.")
     return df.drop(columns=drop, errors="ignore")
 
+
 def load_datasets(
-    train_path: str | Path | None = None,
-    val_path: str | Path | None = None,
-    test_path: str | Path | None = None,
-    date_column: str = "current_fight_date",
-    include_odds: bool = True,
+        train_path: str | Path | None = None,
+        val_path: str | Path | None = None,
+        test_path: str | Path | None = None,
+        date_column: str = "current_fight_date",
+        include_odds: bool = True,
 ):
     train_path = Path(train_path) if train_path else DATA_DIR / "train_data.csv"
     val_path = Path(val_path) if val_path else DATA_DIR / "val_data.csv"
@@ -118,6 +110,7 @@ def load_datasets(
     print(f"TEST : {te[date_column].min().date()} → {te[date_column].max().date()} | n={len(te)}")
     print(f"Features: {len(feature_cols)}")
     return X_tr_raw, y_tr, X_va_raw, y_va, X_te_raw, y_te, feature_cols
+
 
 # ==================== LEAKAGE-SAFE PREPROCESS ====================
 
@@ -161,6 +154,7 @@ def fit_transform_preprocess(X_tr_raw: pd.DataFrame, X_va_raw: pd.DataFrame, X_t
         assert not df.select_dtypes(include=[np.number]).isna().any().any(), f"Numeric NaN in {nm}"
 
     return X_tr, X_va, X_te
+
 
 # ==================== FEATURE SELECTION ====================
 
@@ -207,23 +201,25 @@ def select_top_features_by_xgb(X_tr: pd.DataFrame, y_tr: pd.Series, k: int, enab
 
     print(f"[FS] Selected {len(selected)} features.")
     if FEATURE_PREVIEW_N > 0 and score:
-        topn = [n for n, _ in sorted(score.items(), key=lambda kv: kv[1], reverse=True)][:min(FEATURE_PREVIEW_N, len(score))]
+        topn = [n for n, _ in sorted(score.items(), key=lambda kv: kv[1], reverse=True)][
+               :min(FEATURE_PREVIEW_N, len(score))]
         print("[FS] Top by gain:", ", ".join(topn))
     return selected
+
 
 # ==================== SAVE HELPERS ====================
 
 def _save_candidate_model(
-    trial_num: int,
-    best_n: int,
-    base_params: dict,
-    X_tr_sel: pd.DataFrame, y_tr: pd.Series,
-    X_va_sel: pd.DataFrame, y_va: pd.Series,
-    X_te_sel: pd.DataFrame | None = None, y_te: pd.Series | None = None,
-    run_tag: str = "ufc_xgb_single",
-    evals_result: dict | None = None,
-    best_idx: int | None = None,
-    gap_at_best: float | None = None,
+        trial_num: int,
+        best_n: int,
+        base_params: dict,
+        X_tr_sel: pd.DataFrame, y_tr: pd.Series,
+        X_va_sel: pd.DataFrame, y_va: pd.Series,
+        X_te_sel: pd.DataFrame | None = None, y_te: pd.Series | None = None,
+        run_tag: str = "ufc_xgb_single",
+        evals_result: dict | None = None,
+        best_idx: int | None = None,
+        gap_at_best: float | None = None,
 ):
     """Refit with fixed n_estimators (TRAIN+VAL if REFIT_ON_TRAIN_PLUS_VAL) and save immediately.
        Also saves an annotated PNG plot if available.
@@ -240,22 +236,22 @@ def _save_candidate_model(
 
     # Compute VAL metrics for filename + gating
     va_proba = model.predict_proba(X_va_sel)[:, 1]
-    va_pred  = (va_proba >= 0.5).astype(int)
-    va_ll    = log_loss(y_va, va_proba)
-    va_acc   = accuracy_score(y_va, va_pred)
+    va_pred = (va_proba >= 0.5).astype(int)
+    va_ll = log_loss(y_va, va_proba)
+    va_acc = accuracy_score(y_va, va_pred)
 
     # Train logloss for gap
     tr_proba = model.predict_proba(X_tr_sel)[:, 1]
-    tr_ll    = log_loss(y_tr, tr_proba)
-    gap      = abs(tr_ll - va_ll) if gap_at_best is None else gap_at_best
+    tr_ll = log_loss(y_tr, tr_proba)
+    gap = abs(tr_ll - va_ll) if gap_at_best is None else gap_at_best
 
     # Optional TEST peek (kept off by default)
     test_part = ""
     if AUTOSAVE_INCLUDE_TEST and X_te_sel is not None and y_te is not None:
         te_proba = model.predict_proba(X_te_sel)[:, 1]
-        te_pred  = (te_proba >= 0.5).astype(int)
-        te_ll    = log_loss(y_te, te_proba)
-        te_acc   = accuracy_score(y_te, te_pred)
+        te_pred = (te_proba >= 0.5).astype(int)
+        te_ll = log_loss(y_te, te_proba)
+        te_acc = accuracy_score(y_te, te_pred)
         test_part = f"_TESTacc{te_acc:.3f}_TESTll{te_ll:.3f}"
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -277,6 +273,7 @@ def _save_candidate_model(
             save_plots_as_png=SAVE_PLOTS_AS_PNG,
         )
 
+
 # ==================== TRAINER ====================
 
 def _choose_best_index(evals_result: dict) -> tuple[int, float, float, float]:
@@ -296,11 +293,12 @@ def _choose_best_index(evals_result: dict) -> tuple[int, float, float, float]:
 
     return best_idx, float(va_ll[best_idx]), float(tr_ll[best_idx]), float(va_er[best_idx])
 
+
 def train_single_split(
-    optuna_trials: int = 80,
-    include_odds: bool = True,
-    run_tag: str = "ufc_xgb_single",
-    use_gpu: bool = True,
+        optuna_trials: int = 80,
+        include_odds: bool = True,
+        run_tag: str = "ufc_xgb_single",
+        use_gpu: bool = True,
 ) -> dict:
     print("=" * 70)
     print("  SINGLE-SPLIT TRAINER (leakage-safe, autosave passing trials)")
@@ -323,7 +321,7 @@ def train_single_split(
     # Configure pruning metric & study direction based on objective
     if OPTUNA_OBJECTIVE.lower() == "accuracy":
         prune_metric = "validation_1-error"  # lower = better
-        study_direction = "minimize"         # we minimize error
+        study_direction = "minimize"  # we minimize error
     else:
         prune_metric = "validation_1-logloss"
         study_direction = "minimize"
@@ -407,10 +405,10 @@ def train_single_split(
         if OPTUNA_OBJECTIVE.lower() == "accuracy":
             return float(va_err_at_best)  # minimize error == maximize accuracy
         else:
-            return float(va_ll_at_best)   # minimize logloss
+            return float(va_ll_at_best)  # minimize logloss
 
     study = optuna.create_study(direction=study_direction,
-                                sampler=optuna.samplers.TPESampler(seed=42),
+                                sampler=optuna.samplers.TPESampler(),
                                 pruner=MedianPruner(n_warmup_steps=10))
     study.optimize(objective, n_trials=optuna_trials)
 
@@ -466,12 +464,12 @@ def train_single_split(
 
     # Evaluate on VAL (for filename) and TEST (final reporting)
     va_proba = refit_model.predict_proba(X_va_sel)[:, 1]
-    va_pred  = (va_proba >= 0.5).astype(int)
+    va_pred = (va_proba >= 0.5).astype(int)
     va_logloss = log_loss(y_va, va_proba)
     va_acc = accuracy_score(y_va, va_pred)
 
     te_proba = refit_model.predict_proba(X_te_sel)[:, 1]
-    te_pred  = (te_proba >= 0.5).astype(int)
+    te_pred = (te_proba >= 0.5).astype(int)
     te_logloss = log_loss(y_te, te_proba)
     te_acc = accuracy_score(y_te, te_pred)
     te_auc = roc_auc_score(y_te, te_proba)
@@ -498,13 +496,14 @@ def train_single_split(
         "optuna_objective": OPTUNA_OBJECTIVE,
     }
 
+
 # ==================== MAIN ====================
 
 if __name__ == "__main__":
     try:
         training_controller.start_listener()
         res = train_single_split(
-            optuna_trials=250,           # tune as needed
+            optuna_trials=250,  # tune as needed
             include_odds=INCLUDE_ODDS_COLUMNS,
             run_tag="ufc_xgb_single",
             use_gpu=True,
