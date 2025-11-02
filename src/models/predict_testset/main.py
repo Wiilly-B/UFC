@@ -309,7 +309,7 @@ class Config:
 # ============================== ENTRYPOINT ==============================
 
 CONFIG = Config(
-    use_calibration=False,
+    use_calibration=True,
     calibration_type='isotonic',
     calibration_backend='cv',
     initial_bankroll=10000,
