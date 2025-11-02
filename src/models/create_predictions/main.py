@@ -571,7 +571,7 @@ EXAMPLE_MATCHUPS = [
         'open_odds_b': None,
         'closing_odds_a': None,
         'closing_odds_b': None,
-        'fight_date': "2025-08-09"
+        'fight_date': "2025-08-08"
     }
 ]
 
