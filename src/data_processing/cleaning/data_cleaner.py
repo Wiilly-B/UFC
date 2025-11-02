@@ -749,6 +749,150 @@ class MatchupProcessor:
 
         return pd.concat([df, pd.DataFrame(diff_columns), pd.DataFrame(ratio_columns)], axis=1)
 
+    def select_top_features(self, matchup_data_file: str, n_past_fights: int = 3) -> pd.DataFrame:
+        """
+        Select top ~150 features based on predictive importance.
+        Keeps individual fighter stats (_a, _b) and differentials (_diff).
+
+        Args:
+            matchup_data_file: Path to the matchup data CSV file
+            n_past_fights: Number of past fights used in feature engineering (default: 3)
+
+        Returns:
+            DataFrame with selected features
+        """
+        print("Loading matchup data for feature selection...")
+        matchup_df = self.fight_processor._load_csv(matchup_data_file)
+
+        # Tier 1: Must-Keep Core Features (~30 features)
+        tier1_features = [
+            # Current fight odds
+            'current_fight_open_odds', 'current_fight_open_odds_b',
+            'current_fight_open_odds_diff', 'current_fight_open_odds_ratio',
+            'current_fight_closing_odds', 'current_fight_closing_odds_b',
+            'current_fight_closing_odds_diff', 'current_fight_closing_odds_ratio',
+            'current_fight_closing_open_diff_a', 'current_fight_closing_open_diff_b',
+            # Age
+            'current_fight_age', 'current_fight_age_b', 'current_fight_age_diff',
+            # ELO
+            'current_fight_pre_fight_elo_diff', 'current_fight_pre_fight_elo_ratio',
+            'current_fight_pre_fight_elo_a', 'current_fight_pre_fight_elo_b',
+            # Streaks
+            'current_fight_win_streak_diff', 'current_fight_win_streak_a', 'current_fight_win_streak_b',
+            'current_fight_loss_streak_diff', 'current_fight_loss_streak_a', 'current_fight_loss_streak_b',
+            # Days since last fight
+            'current_fight_days_since_last_diff', 'current_fight_days_since_last_ratio',
+            'current_fight_days_since_last_a', 'current_fight_days_since_last_b',
+            # Quick-win engineered features
+            'finish_rate_a', 'finish_rate_b', 'finish_rate_diff',
+            'activity_penalty_a', 'activity_penalty_b', 'activity_advantage',
+            'momentum_a', 'momentum_b', 'momentum_diff',
+        ]
+
+        # Tier 2: Recent Performance Differentials (~40 features)
+        tier2_features = []
+        recent_metrics = [
+            'significant_strikes_landed', 'significant_strikes_rate', 'total_strikes_landed',
+            'head_landed', 'body_landed', 'leg_landed',
+            'distance_landed', 'clinch_landed', 'ground_landed',
+            'takedown_successful', 'takedown_rate', 'submission_attempt', 'control',
+            'knockdowns', 'knockdowns_per_15min'
+        ]
+        for metric in recent_metrics:
+            tier2_features.extend([
+                f'matchup_{metric}_diff_avg_last_{n_past_fights}',
+                f'{metric}_fighter_a_avg_last_{n_past_fights}',
+                f'{metric}_fighter_b_avg_last_{n_past_fights}'
+            ])
+
+        # Tier 3: Advanced Metrics (~35 features)
+        tier3_features = []
+        advanced_metrics = [
+            'damage_ratio', 'takedown_defense_rate', 'strike_defense_rate',
+            'sig_strikes_absorbed_per_min', 'submission_defense', 'control_advantage',
+            'opponent_quality', 'quality_adjusted_win', 'opponent_recent_form',
+            'opponent_momentum', 'opponent_finish_threat',
+            'ewm_win_rate', 'ewm_finish_rate', 'ewm_strike_accuracy',
+            'win_rate_trajectory', 'finish_rate_trajectory'
+        ]
+        for metric in advanced_metrics:
+            tier3_features.extend([
+                f'{metric}_fighter_a_avg_last_{n_past_fights}',
+                f'{metric}_fighter_b_avg_last_{n_past_fights}'
+            ])
+            # Add diff if it exists
+            diff_col = f'matchup_{metric}_diff_avg_last_{n_past_fights}'
+            if diff_col not in tier3_features:
+                tier3_features.append(diff_col)
+
+        # Tier 4: Fighting Style (~25 features)
+        tier4_features = []
+        style_metrics = [
+            'striker_score', 'grappler_score', 'pressure_score', 'style_confidence',
+            'significant_strikes_landed_per_min', 'total_strikes_landed_per_min',
+            'takedowns_per_15min'
+        ]
+        for metric in style_metrics:
+            tier4_features.extend([
+                f'{metric}_fighter_a_avg_last_{n_past_fights}',
+                f'{metric}_fighter_b_avg_last_{n_past_fights}'
+            ])
+            # Add diff if it exists
+            diff_col = f'matchup_{metric}_diff_avg_last_{n_past_fights}'
+            if diff_col not in tier4_features:
+                tier4_features.append(diff_col)
+
+        # Tier 5: Career Context (~20 features)
+        tier5_features = []
+        career_metrics = [
+            'wins_by_ko', 'wins_by_submission', 'win_rate_by_ko', 'win_rate_by_submission',
+            'significant_strikes_rate_career', 'takedown_rate_career', 'total_strikes_rate_career',
+            'layoff_penalty', 'ring_rust', 'years_of_experience'
+        ]
+        for metric in career_metrics:
+            tier5_features.extend([
+                f'{metric}_fighter_a_avg_last_{n_past_fights}',
+                f'{metric}_fighter_b_avg_last_{n_past_fights}'
+            ])
+
+        # Combine all tiers
+        selected_features = tier1_features + tier2_features + tier3_features + tier4_features + tier5_features
+
+        # Always keep these essential columns
+        essential_columns = ['winner', 'current_fight_date']
+
+        # Keep fighter names if they exist
+        if 'fighter_a' in matchup_df.columns:
+            essential_columns.extend(['fighter_a', 'fighter_b'])
+
+        # Filter to only existing columns
+        available_features = [col for col in selected_features if col in matchup_df.columns]
+        available_essential = [col for col in essential_columns if col in matchup_df.columns]
+
+        # Combine and remove duplicates
+        final_columns = list(dict.fromkeys(available_essential + available_features))
+
+        # Create filtered dataframe
+        filtered_df = matchup_df[final_columns].copy()
+
+        print(f"\nFeature Selection Summary:")
+        print(f"  Original features: {len(matchup_df.columns)}")
+        print(f"  Selected features: {len(filtered_df.columns) - len(available_essential)}")
+        print(f"  Essential columns: {len(available_essential)}")
+        print(f"  Total columns: {len(filtered_df.columns)}")
+        print(f"\nFeature breakdown by tier:")
+        print(f"  Tier 1 (Core): {len([f for f in tier1_features if f in available_features])}")
+        print(f"  Tier 2 (Recent Performance): {len([f for f in tier2_features if f in available_features])}")
+        print(f"  Tier 3 (Advanced Metrics): {len([f for f in tier3_features if f in available_features])}")
+        print(f"  Tier 4 (Fighting Style): {len([f for f in tier4_features if f in available_features])}")
+        print(f"  Tier 5 (Career Context): {len([f for f in tier5_features if f in available_features])}")
+
+        # Save the filtered data
+        output_filename = f'matchup data/matchup_data_{n_past_fights}_avg_selected_features.csv'
+        self.fight_processor._save_csv(filtered_df, output_filename)
+
+        return filtered_df
+
     def split_train_val_test(
         self,
         matchup_data_file: str,
@@ -906,8 +1050,12 @@ def main():
 
     matchup_processor.create_matchup_data('processed/combined_sorted_fighter_stats.csv', 3, True)
 
+    # NEW: Select top features
+    matchup_processor.select_top_features('matchup data/matchup_data_3_avg_name.csv', n_past_fights=3)
+
+    # Use the filtered dataset for train/test split
     matchup_processor.split_train_val_test(
-        'matchup data/matchup_data_3_avg_name.csv',
+        'matchup data/matchup_data_3_avg_selected_features.csv',  # Use filtered data
         '2025-01-01',
         '2025-12-31',
         15

@@ -20,16 +20,16 @@ from helper import TrainingController, annotated_trial_plot, set_matplotlib_back
 
 # ---- Plotting / preview ----
 SHOW_PLOTS = True
-SHOW_TRIAL_PLOTS = False
-FEATURE_PREVIEW_N = 12
+SHOW_TRIAL_PLOTS = True
+FEATURE_PREVIEW_N = 100
 set_matplotlib_backend(SHOW_PLOTS)  # switch to Agg if not showing plots
 
 # ---- Feature selection ----
 USE_TOP_K_FEATURES = True
-TOP_K_FEATURES = 300
+TOP_K_FEATURES = 10000
 
 # ---- Columns / odds ----
-INCLUDE_ODDS_COLUMNS = False  # False -> drop odds/open/close-related columns
+INCLUDE_ODDS_COLUMNS = True  # False -> drop odds/open/close-related columns
 
 # ---- Refit / Autosave / Plots ----
 REFIT_ON_TRAIN_PLUS_VAL = True
