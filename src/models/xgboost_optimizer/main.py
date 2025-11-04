@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
 from optuna.pruners import MedianPruner
-from optuna.integration import XGBoostPruningCallback
 import numpy as np
 import optuna
 import pandas as pd
@@ -227,8 +226,8 @@ def train_single_split(optuna_trials=10, include_odds=True, run_tag="ufc_xgb_sin
         }
 
         model = xgb.XGBClassifier(**params)
-        model.fit(X_tr_sel, y_tr, eval_set=[(X_tr_sel, y_tr), (X_va_sel, y_va)], verbose=False,
-                 callbacks=[XGBoostPruningCallback(trial, prune_metric)])
+        # Note: XGBoost 2.0+ removed callbacks parameter, pruning handled by Optuna
+        model.fit(X_tr_sel, y_tr, eval_set=[(X_tr_sel, y_tr), (X_va_sel, y_va)], verbose=False)
 
         ev = model.evals_result()
         if cfg.show_trial_plots:
