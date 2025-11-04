@@ -70,8 +70,8 @@ class DataProcessor:
             left_on='fighter', right_on='name',
             how='left'
         )
-        ufc_stats['age'] = (ufc_stats['fight_date'] - ufc_stats['dob']).dt.days / 365.25
-        ufc_stats['age'] = ufc_stats['age'].fillna(np.nan).round().astype(float)
+        ufc_stats['age'] = ((ufc_stats['fight_date'] - ufc_stats['dob']).dt.days / 365.25).round()
+        ufc_stats['age'] = ufc_stats['age'].fillna(np.nan).astype(float)
         ufc_stats.loc[ufc_stats['age'] < 0, 'age'] = np.nan
 
         ufc_stats = ufc_stats.drop(['round', 'location', 'name'], axis=1)
@@ -468,7 +468,7 @@ class FighterUtils:
                 expected = group['knockdowns'].iloc[:i+1].sum()
                 actual = group.iloc[i]['knockdowns_career']
                 if abs(expected - actual) > 0.01:
-                    print(f"❌ LEAKAGE: Career stats for {fighter_name}, fight {i+1}")
+                    print(f"LEAKAGE: Career stats for {fighter_name}, fight {i+1}")
                     self.verification_results.append(('career_stats', fighter_name, False))
                     return
         self.verification_results.append(('career_stats', fighter_name, True))
@@ -478,7 +478,7 @@ class FighterUtils:
         fighter_name = group['fighter'].iloc[0]
         first_fight = group.iloc[0]
         if first_fight['win_streak'] != 0 or first_fight['loss_streak'] != 0:
-            print(f"❌ LEAKAGE: Streaks for {fighter_name} start non-zero")
+            print(f"LEAKAGE: Streaks for {fighter_name} start non-zero")
             self.verification_results.append(('streaks', fighter_name, False))
         else:
             self.verification_results.append(('streaks', fighter_name, True))
@@ -487,7 +487,7 @@ class FighterUtils:
         """Verify total fight counts."""
         fighter_name = group['fighter'].iloc[0]
         if group.iloc[0]['total_fights'] != 1:
-            print(f"❌ LEAKAGE: Total fights for {fighter_name} doesn't start at 1")
+            print(f"LEAKAGE: Total fights for {fighter_name} doesn't start at 1")
             self.verification_results.append(('total_fights', fighter_name, False))
         else:
             self.verification_results.append(('total_fights', fighter_name, True))

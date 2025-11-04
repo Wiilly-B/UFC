@@ -245,13 +245,6 @@ def main(config=None):
         y_pred_proba_avg = np.mean(y_pred_proba_list, axis=0) if config.use_ensemble else y_pred_proba_list[0]
         y_pred = (y_pred_proba_avg[:, 1] > y_pred_proba_avg[:, 0]).astype(int)
         _print_metrics(y_test, y_pred, y_pred_proba_avg)
-
-        if config.enable_plots:
-            try:
-                from visualization import create_calibration_plots
-                create_calibration_plots(y_test, y_pred_proba_list, config)
-            except Exception as e:
-                print(f"\n[Warning] Calibration plots failed: {str(e)}")
     finally:
         sys.stdout = old_stdout
         output = mystdout.getvalue()
@@ -301,10 +294,6 @@ class Config:
     encoder_path: str = '../../../saved_models/encoders/category_encoder.pkl'
     display_columns: List[str] = field(default_factory=lambda: ['current_fight_date', 'fighter_a', 'fighter_b'])
 
-    # === OUTPUT ===
-    enable_plots: bool = True
-    output_dir: str = '../../outputs/calibration_plots'
-
 
 # ============================== ENTRYPOINT ==============================
 
@@ -319,7 +308,6 @@ CONFIG = Config(
     model_filename_pattern=r'ufc_xgb_single_(?:TRIAL\d{3}|FINAL).*\.json$',
     use_ensemble=True,
     require_trained_encoder=True,
-    enable_plots=True,
 )
 
 if __name__ == "__main__":

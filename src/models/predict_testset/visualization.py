@@ -11,9 +11,7 @@ from sklearn.calibration import calibration_curve
 
 def create_calibration_plots(y_test: np.ndarray, y_pred_proba_list: List[np.ndarray], config) -> Dict[str, str]:
     """Create all calibration plots based on configuration."""
-    os.makedirs(config.output_dir, exist_ok=True)
     cal_dir = os.path.join(config.output_dir, config.calibration_type if config.use_calibration else 'uncalibrated')
-    os.makedirs(cal_dir, exist_ok=True)
 
     model_names = [os.path.splitext(f)[0] for f in config.model_files[:len(y_pred_proba_list)]]
     plot_files = {}

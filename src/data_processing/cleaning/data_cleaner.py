@@ -452,19 +452,19 @@ class MatchupProcessor:
 
         # Age: Calculate based on reference_date
         if fighter_a_age is not None:
-            current_fight_dict['age'] = fighter_a_age
+            current_fight_dict['age'] = round(fighter_a_age)
         else:
             # Calculate age from last fight + time elapsed
             last_fight_age_a = most_recent_a.get('age', 30)
             days_elapsed_a = (reference_date - most_recent_a['fight_date']).days
-            current_fight_dict['age'] = last_fight_age_a + (days_elapsed_a / 365.25)
+            current_fight_dict['age'] = round(last_fight_age_a + (days_elapsed_a / 365.25))
 
         if fighter_b_age is not None:
-            current_fight_dict['age_b'] = fighter_b_age
+            current_fight_dict['age_b'] = round(fighter_b_age)
         else:
             last_fight_age_b = most_recent_b.get('age', 30)
             days_elapsed_b = (reference_date - most_recent_b['fight_date']).days
-            current_fight_dict['age_b'] = last_fight_age_b + (days_elapsed_b / 365.25)
+            current_fight_dict['age_b'] = round(last_fight_age_b + (days_elapsed_b / 365.25))
 
         # Days since last fight: Calculate from reference_date
         current_fight_dict['days_since_last_fight'] = (reference_date - most_recent_a['fight_date']).days
