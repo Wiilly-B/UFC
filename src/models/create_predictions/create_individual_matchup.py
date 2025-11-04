@@ -65,8 +65,9 @@ def load_models(model_dir: str, pattern: str = r'ufc_xgb_single_(?:TRIAL\d{3}|FI
     for path in candidates:
         model = xgb.XGBClassifier(enable_categorical=True)
         model.load_model(path)
-        # Add classes_ attribute required by scikit-learn calibration
-        model.classes_ = np.array([0, 1])
+        # XGBoost 3.x has classes_ as read-only property
+        # Use object.__setattr__ to bypass the property setter for calibration compatibility
+        object.__setattr__(model, '_classes', np.array([0, 1]))
         models.append(model)
 
     print(f"Loaded {len(models)} models from {folder}")

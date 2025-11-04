@@ -99,9 +99,9 @@ class ModelManager:
             raise FileNotFoundError(f"Model not found: {model_path}")
         model = xgb.XGBClassifier(enable_categorical=True)
         model.load_model(model_path)
-        # Add classes_ attribute required by scikit-learn calibration
-        # Binary classification: classes are [0, 1]
-        model.classes_ = np.array([0, 1])
+        # XGBoost 3.x has classes_ as read-only property
+        # Use object.__setattr__ to bypass the property setter for calibration compatibility
+        object.__setattr__(model, '_classes', np.array([0, 1]))
         return model
 
     def prepare_datasets(self) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.DataFrame]:
