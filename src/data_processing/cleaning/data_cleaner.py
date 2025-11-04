@@ -2,11 +2,14 @@
 UFC Fight Analysis Module - Simplified
 Processes UFC fight data with advanced feature engineering and leakage verification.
 """
-import warnings, os
+import warnings, os, sys
 from pathlib import Path
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass, field
+
+# Add project root to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
 import pandas as pd
 import numpy as np
