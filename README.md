@@ -4,7 +4,7 @@ A comprehensive machine learning system for predicting UFC fight outcomes and ev
 
 ## Overview
 
-This project implements a complete end-to-end pipeline that processes historical UFC fight data, trains predictive models, and evaluates betting strategies. The system demonstrates advanced machine learning techniques including feature engineering with ELO rating systems, ensemble modeling, probability calibration, and optimal bet sizing strategies.
+This project implements a complete end-to-end pipeline that processes historical UFC fight data, trains predictive models, and evaluates betting strategies. The system demonstrates advanced machine learning techniques, including feature engineering with ELO rating systems, ensemble modeling, probability calibration, and optimal bet sizing strategies.
 
 **Key Capabilities:**
 - Advanced feature engineering with dynamic ELO ratings and historical fighter statistics
@@ -68,7 +68,6 @@ UFC/
 ### Prerequisites
 
 - Python 3.8 or higher
-- 4GB RAM minimum (8GB recommended)
 - CPU-only training supported (no GPU required)
 
 ### Setup Instructions
@@ -81,17 +80,30 @@ cd UFC
 
 2. **Create and activate virtual environment (recommended):**
 ```bash
-python -m venv venv
 
-# Windows:
-venv\Scripts\activate
-
-# macOS/Linux:
+sudo apt install python3-venv
+python3 -m venv venv
 source venv/bin/activate
+
 ```
 
-3. **Install dependencies:**
+3. **Git LFS:**
+
+Install git LSF
 ```bash
+sudo apt update
+sudo apt install git-lfs
+```
+Run these commands in the terminal to fetch CSV files.
+```bash
+git lfs install
+git lfs pull
+git lfs checkout
+```
+
+4. **Install dependencies:**
+```bash
+sudo apt install python3-pip
 pip install -r requirements.txt
 ```
 
@@ -178,7 +190,8 @@ select_features: bool = True             # Apply feature selection
 **Objective:** Train ensemble XGBoost models with automated hyperparameter optimization.
 
 ```bash
-cd src/models/xgboost_optimizer
+cd ../..
+cd models/xgboost_optimizer
 python main.py
 ```
 
@@ -243,7 +256,8 @@ ufc_xgb_single_TRIAL{num}_VALacc{acc}_GAP{gap}_VALll{logloss}_{timestamp}.json
 **Objective:** Evaluate model ensemble on test set and simulate betting strategies.
 
 ```bash
-cd src/models/predict_testset
+cd ../..
+cd models/predict_testset
 python main.py
 ```
 
@@ -368,7 +382,8 @@ Monthly Performance:
 **Objective:** Generate predictions for specific upcoming matchups with calibrated probabilities.
 
 ```bash
-cd src/models/create_predictions
+cd ../..
+cd models/create_predictions
 python create_individual_matchup.py
 ```
 
@@ -802,7 +817,7 @@ CONFIG = Config(
 
 **Core Technologies:**
 - **Python 3.8+:** Primary programming language
-- **XGBoost 2.0+:** Gradient boosting framework
+- **XGBoost 3.0+:** Gradient boosting framework
 - **Optuna 3.3+:** Hyperparameter optimization
 - **scikit-learn 1.3+:** Calibration, preprocessing, metrics
 - **pandas 2.0+:** Data manipulation
@@ -830,60 +845,7 @@ CONFIG = Config(
 
 ---
 
-## Important Disclaimers
-
-**Educational and Portfolio Purposes Only**
-
-This project demonstrates machine learning and data science capabilities for educational and portfolio purposes. It is not intended as a profitable betting system.
-
-**Risks and Limitations:**
-
-**Financial Risks:**
-- Sports betting involves substantial financial risk
-- Past performance does not guarantee future results
-- House edge (vig/juice) typically 4-5%
-- Variance can lead to extended losing periods
-- Gambling addiction is a serious issue
-
-**Model Limitations:**
-- Does not account for injuries, weight cuts, or fight week events
-- Historical data may not reflect current fighter evolution
-- Small sample sizes lead to high performance variance
-- Betting markets are highly efficient
-- Model assumes odds are accurate (may not be true for all markets)
-
-**Regulatory Considerations:**
-- Sports betting legality varies by jurisdiction
-- Verify local laws before any wagering activity
-- Only wager amounts you can afford to lose entirely
-- Seek help if gambling becomes problematic
-
-**Technical Limitations:**
-- Predictions are probabilistic, not deterministic
-- Calibration assumes validation set is representative
-- Model performance degrades as fighters evolve
-- Historical relationships may not persist
-
----
-
-## Contributing
-
-This is a portfolio project. For questions, suggestions, or issues, please open a GitHub issue.
-
----
-
-## License
-
-This project is provided for educational and demonstration purposes. Consult local regulations regarding sports betting and gambling.
-
----
 
 ## Contact
 
-**Project Author:** Portfolio demonstration of machine learning and sports analytics expertise.
-
-For technical questions or collaboration inquiries, please open an issue on GitHub.
-
----
-
-**Final Note:** Professional sports betting is exceptionally difficult. Even sophisticated models typically achieve modest edges that are eroded by market efficiency and variance. This project demonstrates technical proficiency in machine learning, feature engineering, and statistical modeling rather than presenting a guaranteed profitable betting system.
+williambillqinshen@gmail.com
