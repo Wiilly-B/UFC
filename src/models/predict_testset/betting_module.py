@@ -171,37 +171,42 @@ class BettingEvaluator:
                 # Uses 60% agreement threshold scaled to actual number of models available
                 min_models = max(1, int(np.ceil(num_models * 0.6))) if self.config.use_ensemble else 1
 
-                bet_fighter = None
-                winning_probability = 0
-                odds = 0
-                ev = 0
-
                 # Use min_probability if available, otherwise fall back to manual_threshold
                 min_prob = getattr(self.config, 'min_probability', self.config.manual_threshold)
 
-                # Check if either fighter has positive EV above threshold
+                # Collect bets for both fighters if they have positive EV
+                bets_to_place = []
+
+                # Check fighter A for positive EV
                 if ev_fighter_a > self.config.min_ev_threshold and models_agreeing >= min_models:
                     if prob_fighter_a >= min_prob:
                         # Skip if odds outside range
                         if not (odds_a < self.config.min_odds or odds_a > self.config.max_underdog_odds):
-                            if bet_fighter is None or ev_fighter_a > ev:
-                                bet_fighter = row['fighter_a']
-                                winning_probability = prob_fighter_a
-                                odds = odds_a
-                                ev = ev_fighter_a
+                            bets_to_place.append({
+                                'fighter': row['fighter_a'],
+                                'probability': prob_fighter_a,
+                                'odds': odds_a,
+                                'ev': ev_fighter_a
+                            })
 
+                # Check fighter B for positive EV
                 if ev_fighter_b > self.config.min_ev_threshold and models_agreeing >= min_models:
                     if prob_fighter_b >= min_prob:
                         # Skip if odds outside range
                         if not (odds_b < self.config.min_odds or odds_b > self.config.max_underdog_odds):
-                            if bet_fighter is None or ev_fighter_b > ev:
-                                bet_fighter = row['fighter_b']
-                                winning_probability = prob_fighter_b
-                                odds = odds_b
-                                ev = ev_fighter_b
+                            bets_to_place.append({
+                                'fighter': row['fighter_b'],
+                                'probability': prob_fighter_b,
+                                'odds': odds_b,
+                                'ev': ev_fighter_b
+                            })
 
-                # Place bet if we found a valid bet
-                if bet_fighter is not None:
+                # Place all valid bets (can be 0, 1, or 2 bets per fight)
+                for bet_info in bets_to_place:
+                    bet_fighter = bet_info['fighter']
+                    winning_probability = bet_info['probability']
+                    odds = bet_info['odds']
+                    ev = bet_info['ev']
 
                     # Calculate stakes
                     fixed_available_before = available_fixed_bankroll
